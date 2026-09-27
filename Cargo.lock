@@ -1102,6 +1102,27 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "axum-server",
+ "futures",
+ "galaxia-fhs",
+ "libp2p",
+ "libp2p-stream",
+ "rig",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-normalization",
+ "uuid",
+]
+
+[[package]]
+name = "galaxia-fhs"
+version = "0.1.0"
+source = "git+https://github.com/rafex/galaxIA-SDK?branch=main#b1a0a6cd367b4644ffae6fbb9f62b3a6d2e6ea70"
+dependencies = [
  "bs58",
  "ed25519-dalek 2.2.0",
  "futures",
@@ -1110,7 +1131,6 @@ dependencies = [
  "libp2p-stream",
  "prost 0.13.5",
  "prost-build",
- "rig",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -1119,8 +1139,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
- "tracing-subscriber",
- "unicode-normalization",
  "uuid",
  "webpki-roots",
 ]
@@ -2148,6 +2166,7 @@ dependencies = [
 [[package]]
 name = "libp2p-websocket"
 version = "0.46.0"
+source = "git+https://github.com/rafex/galaxIA-SDK?branch=main#b1a0a6cd367b4644ffae6fbb9f62b3a6d2e6ea70"
 dependencies = [
  "either",
  "futures",

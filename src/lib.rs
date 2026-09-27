@@ -1,7 +1,8 @@
 pub mod config;
 pub mod llm;
-pub mod p2p;
-pub mod protocol;
 pub mod runtime;
 pub mod session;
-pub mod signing;
+
+// Base FHS compartida (galaxIA-SDK/rust/fhs); se reexporta para conservar las
+// rutas `crate::p2p`, `crate::protocol` y `crate::signing`.
+pub use galaxia_fhs::{p2p, protocol, signing};

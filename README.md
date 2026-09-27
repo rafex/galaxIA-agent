@@ -14,16 +14,21 @@ Navigator Rust/Rig está activo en Bastion y se ha probado contra Atlas, Star,
 KB, RAG y OCR. El runtime TypeScript de Core queda como referencia histórica;
 no se debe levantar junto al agente Rust porque comparten identidad y puertos.
 
+La base FHS (IDL, firmas, identidad, TLS, nodo libp2p, misiones) vive en el
+crate `galaxia-fhs` de [galaxIA-SDK](https://github.com/rafex/galaxIA-SDK/tree/main/rust)
+y se reexporta como `p2p`, `protocol` y `signing`; aquí queda lo propio del
+Navigator (runtime, sesión del Portal, adaptador Rig).
+
 | Pieza | Módulo |
 |---|---|
-| Identidad Ed25519 → PeerId + `did:key` (mismo archivo que el TS) | `p2p/identity.rs` |
-| Transporte WSS+TLS, Noise, yamux; TLS con pin del certificado del lab | `p2p/tls.rs`, `vendor/libp2p-websocket` |
-| Nodo: GossipSub, Kademlia (cliente), identify, ping, streams `/fhs/v1/0.1.0`, reconexión al bootstrap | `p2p/node.rs` |
-| `NodeAdvertise` firmados → caché con TTL; anuncio propio cada 30 s y tras cada conexión nueva | `p2p/peer_cache.rs`, `p2p/wire.rs` |
-| Beacon firmado en el DHT (`/fhs/beacon/<did>`), republicado cada 30 min | `p2p/node.rs`, `p2p/wire.rs` |
-| offer / bid / assign firmados y elección del ganador | `p2p/mission.rs` |
-| Misiones de chat (con streaming de deltas) y de tools | `p2p/client.rs` |
-| Firmas y framing de Envelopes (verificación sobre bytes crudos) | `signing.rs`, `p2p/framing.rs` |
+| Identidad Ed25519 → PeerId + `did:key` (mismo archivo que el TS) | `fhs::p2p/identity.rs` |
+| Transporte WSS+TLS, Noise, yamux; TLS con pin del certificado del lab | `fhs::p2p/tls.rs`, `fhs::vendor/libp2p-websocket` |
+| Nodo: GossipSub, Kademlia (cliente), identify, ping, streams `/fhs/v1/0.1.0`, reconexión al bootstrap | `fhs::p2p/node.rs` |
+| `NodeAdvertise` firmados → caché con TTL; anuncio propio cada 30 s y tras cada conexión nueva | `fhs::p2p/peer_cache.rs`, `fhs::p2p/wire.rs` |
+| Beacon firmado en el DHT (`/fhs/beacon/<did>`), republicado cada 30 min | `fhs::p2p/node.rs`, `fhs::p2p/wire.rs` |
+| offer / bid / assign firmados y elección del ganador | `fhs::p2p/mission.rs` |
+| Misiones de chat (con streaming de deltas) y de tools | `fhs::p2p/client.rs` |
+| Firmas y framing de Envelopes (verificación sobre bytes crudos) | `fhs::signing.rs`, `fhs::p2p/framing.rs` |
 | Turno del agente: OCR determinista con failover, recomendación y consulta de KB, RAG por red, una ronda de tools (como el TS), procedencia | `runtime/agent.rs`, `runtime/kb.rs`, `runtime/providers.rs` |
 | Adaptador Rig → Star (roles y tools reales, streaming) | `llm.rs` |
 | Sesión del Portal: handshake, `agentStart`, `chatRequest`, `kbDecision`, `chatCancel` con aborto real | `session.rs` |

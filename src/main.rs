@@ -38,6 +38,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("FHS_BOOTSTRAP_ADDRS vacío: el nodo queda aislado");
     }
     let node = p2p::node::start(p2p::node::NodeConfig {
+        role: p2p::node::Role::Navigator,
+        agent_version: format!("galaxia-agent/{}", env!("CARGO_PKG_VERSION")),
         identity: identity.clone(),
         listen: config.listen.clone(),
         announce: config.announce.clone(),

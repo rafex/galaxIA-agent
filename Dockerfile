@@ -1,5 +1,6 @@
 # rig-core 0.42 usa la edición 2024; se fija la misma toolchain con la que se
-# desarrolla y prueba. prost-build necesita protoc del sistema.
+# desarrolla y prueba. galaxia-fhs (galaxIA-SDK, por git) compila el IDL con
+# prost-build, que necesita protoc del sistema.
 FROM docker.io/library/rust:1.97-bookworm AS build
 RUN apt-get update \
  && apt-get install -y --no-install-recommends protobuf-compiler \
@@ -7,10 +8,7 @@ RUN apt-get update \
 WORKDIR /src
 ARG COMMIT_HASH=dev
 ENV GALAXIA_COMMIT=$COMMIT_HASH
-COPY Cargo.toml Cargo.lock build.rs ./
-COPY protocol ./protocol
-# Copia de libp2p-websocket con `tls::Config::from_rustls` ([patch.crates-io]).
-COPY vendor ./vendor
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release
 
