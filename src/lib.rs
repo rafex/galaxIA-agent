@@ -12,6 +12,7 @@ pub mod protocol;
 pub mod response;
 pub mod retrieval;
 pub mod runtime;
+pub mod session;
 pub mod signing;
 pub mod star;
 pub mod tools;

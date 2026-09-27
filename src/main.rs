@@ -64,6 +64,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let vetoed: std::collections::HashSet<String> = std::env::var("FHS_VETOED_PROVIDERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|d| d.trim().split('#').next().unwrap_or_default().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
+    tokio::spawn(galaxia_agent::session::serve(
+        node.clone(),
+        galaxia_agent::session::SessionDefaults {
+            preferences: galaxia_agent::runtime::agent::Preferences {
+                vetoed: Arc::new(vetoed),
+                ..Default::default()
+            },
+        },
+    ));
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("probe") {
         return probe(&node, &args[1..]).await;
@@ -239,6 +255,97 @@ async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::er
                 first,
                 t0.elapsed()
             );
+        }
+        Some("portal") => {
+            use galaxia_agent::p2p::{framing, wire};
+            use galaxia_agent::protocol::fhs::{
+                envelope::Payload, AgentStartMessage, ChatRequestMessage, KbDecisionMessage,
+            };
+            let addr: libp2p::Multiaddr = args
+                .get(1)
+                .ok_or("falta la multiaddr del agente")?
+                .parse()?;
+            let question = args
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| "¿Qué dice el artículo 3 sobre la educación?".into());
+            let peer = node.dial(addr).await?;
+            let mut stream = node
+                .stream_control()
+                .open_stream(peer, NodeHandle::fhs_protocol())
+                .await?;
+            let send = |payload| wire::sealed_envelope(&node.identity, "", payload);
+            framing::write_envelope(&mut stream, &send(Payload::Handshake(Default::default())))
+                .await?;
+            let ack = framing::read_verified(&mut stream).await?;
+            println!(
+                "handshake: {}",
+                matches!(ack.and_then(|e| e.payload), Some(Payload::HandshakeAck(_)))
+            );
+            framing::write_envelope(
+                &mut stream,
+                &send(Payload::AgentStart(AgentStartMessage {
+                    session_id: "probe-portal".into(),
+                    scope: "community".into(),
+                    ..Default::default()
+                })),
+            )
+            .await?;
+            framing::write_envelope(
+                &mut stream,
+                &send(Payload::ChatRequest(ChatRequestMessage {
+                    mission_id: "probe-portal".into(),
+                    messages: vec![Message {
+                        role: "user".into(),
+                        content: question,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })),
+            )
+            .await?;
+            let t0 = std::time::Instant::now();
+            while let Some(envelope) = framing::read_verified(&mut stream).await? {
+                match envelope.payload {
+                    Some(Payload::AssistantDelta(d)) => {
+                        print!("{}", d.delta);
+                        let _ = std::io::stdout().flush();
+                    }
+                    Some(Payload::KbRecommended(kb)) => {
+                        println!(
+                            "  · kbRecommended {:?} → acepto",
+                            kb.candidates
+                                .iter()
+                                .map(|c| &c.provider_name)
+                                .collect::<Vec<_>>()
+                        );
+                        framing::write_envelope(
+                            &mut stream,
+                            &send(Payload::KbDecision(KbDecisionMessage {
+                                mission_id: kb.mission_id,
+                                r#use: true,
+                            })),
+                        )
+                        .await?;
+                    }
+                    Some(Payload::AssistantCompleted(done)) => {
+                        println!(
+                            "\n  · assistantCompleted {:?} · {:?}",
+                            done.provenance,
+                            t0.elapsed()
+                        );
+                        break;
+                    }
+                    Some(Payload::Error(e)) => {
+                        println!("  · error {}: {}", e.code, e.message);
+                        break;
+                    }
+                    other => println!(
+                        "  · {:?}",
+                        other.map(|p| format!("{p:?}").chars().take(120).collect::<String>())
+                    ),
+                }
+            }
         }
         Some("turn") => {
             use galaxia_agent::runtime::{
