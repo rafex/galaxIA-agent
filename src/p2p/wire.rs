@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::p2p::identity::NodeIdentity;
 use crate::p2p::peer_cache::now_ms;
 use crate::protocol::fhs::{
-    self, envelope::Payload, Beacon, Envelope, MissionAssignMessage, MissionBidMessage,
-    MissionOfferMessage, NodeAdvertiseMessage,
+    self, envelope::Payload, Beacon, DhtBeaconRecord, Envelope, MissionAssignMessage,
+    MissionBidMessage, MissionOfferMessage, NodeAdvertiseMessage,
 };
 use crate::signing;
 
@@ -57,6 +57,35 @@ pub fn signed_node_advertise(
     };
     message.signature = identity.sign(&signing::node_advertise_payload(&message));
     message.encode_to_vec()
+}
+
+/// Vigencia del beacon en el DHT (igual que el TS y los providers).
+pub const DHT_BEACON_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// Clave DHT del beacon: `/fhs/beacon/<did>` (espacio `fhs` en kad-dht).
+pub fn dht_beacon_key(did: &str) -> Vec<u8> {
+    format!("/fhs/beacon/{did}").into_bytes()
+}
+
+/// `DhtBeaconRecord` firmado. El Portal descarta los registros sin firma
+/// válida (el Navigator TS lo publica sin firma).
+pub fn signed_dht_beacon(
+    identity: &NodeIdentity,
+    beacon: Beacon,
+    multiaddrs: Vec<String>,
+) -> Vec<u8> {
+    let published_at = now_ms();
+    let mut record = DhtBeaconRecord {
+        did: identity.did.clone(),
+        beacon: Some(beacon),
+        multiaddrs,
+        published_at,
+        expires_at: published_at + DHT_BEACON_TTL_MS,
+        fhs_version: FHS_WIRE_VERSION.into(),
+        signature: Vec::new(),
+    };
+    record.signature = identity.sign(&signing::dht_beacon_payload(&record));
+    record.encode_to_vec()
 }
 
 pub fn signed_mission_offer(identity: &NodeIdentity, mut message: MissionOfferMessage) -> Vec<u8> {
@@ -134,6 +163,31 @@ mod tests {
 
     fn identity() -> NodeIdentity {
         NodeIdentity::from_keypair(Keypair::generate_ed25519()).unwrap()
+    }
+
+    #[test]
+    fn dht_beacon_is_signed_like_the_portal_expects() {
+        let id = identity();
+        let bytes = signed_dht_beacon(
+            &id,
+            navigator_beacon("Navigator FHS"),
+            vec!["/ip4/1.2.3.4/tcp/4010/tls/ws".into()],
+        );
+        let record = DhtBeaconRecord::decode(bytes.as_slice()).unwrap();
+        assert_eq!(record.expires_at - record.published_at, DHT_BEACON_TTL_MS);
+        // Misma cadena que readDhtBeacon en portal-chat/p2p-discovery.ts.
+        let expected = format!(
+            "{}:{}:{}:{}",
+            id.did,
+            signing::beacon_sha256(record.beacon.as_ref()),
+            record.published_at,
+            record.expires_at
+        );
+        assert!(signing::verify(&id.did, &expected, &record.signature));
+        assert_eq!(
+            dht_beacon_key("did:key:zX"),
+            b"/fhs/beacon/did:key:zX".to_vec()
+        );
     }
 
     #[test]

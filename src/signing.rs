@@ -13,8 +13,8 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 
 use crate::protocol::fhs::{
-    self, envelope::Payload, Beacon, MissionAssignMessage, MissionBidMessage, MissionOfferMessage,
-    NodeAdvertiseMessage,
+    self, envelope::Payload, Beacon, DhtBeaconRecord, MissionAssignMessage, MissionBidMessage,
+    MissionOfferMessage, NodeAdvertiseMessage,
 };
 
 const DID_KEY_PREFIX: &str = "did:key:z";
@@ -77,6 +77,21 @@ pub fn node_advertise_payload(message: &NodeAdvertiseMessage) -> String {
         message.timestamp,
         message.ttl_seconds
     )
+}
+
+/// `dhtBeaconSignaturePayload` del SDK; el Portal lo verifica al leer el DHT.
+pub fn dht_beacon_payload(record: &DhtBeaconRecord) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        record.did,
+        beacon_sha256(record.beacon.as_ref()),
+        record.published_at,
+        record.expires_at
+    )
+}
+
+pub fn verify_dht_beacon(record: &DhtBeaconRecord) -> bool {
+    verify(&record.did, &dht_beacon_payload(record), &record.signature)
 }
 
 pub fn mission_offer_payload(message: &MissionOfferMessage) -> String {

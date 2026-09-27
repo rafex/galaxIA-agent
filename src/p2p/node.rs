@@ -19,7 +19,7 @@ use libp2p::{
     websocket, yamux, Multiaddr, PeerId, StreamProtocol, Swarm, Transport,
 };
 use serde::Serialize;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 
 use crate::p2p::identity::NodeIdentity;
 use crate::p2p::peer_cache::{now_ms, PeerCache};
@@ -31,6 +31,11 @@ pub const ADVERTISE_TTL_SECONDS: i32 = 60;
 const BOOTSTRAP_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
 const BOOTSTRAP_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Espera tras una conexión nueva antes de anunciarse, para que GossipSub
+/// intercambie suscripciones y el anuncio le llegue al peer recién llegado.
+const ADVERTISE_ON_CONNECT_DELAY: Duration = Duration::from_secs(1);
+/// Cada cuánto se vuelve a publicar el beacon en el DHT.
+const DHT_REPUBLISH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
@@ -51,6 +56,10 @@ pub struct NodeConfig {
     /// Si se da, el nodo publica su `NodeAdvertise` cada 30 s con este beacon.
     /// Con el beacon de Navigator el Portal lo usará: solo en el cambio real.
     pub advertise: Option<Beacon>,
+    /// Si se da, el nodo publica su `DhtBeaconRecord` firmado en
+    /// `/fhs/beacon/<did>`. El Portal lo lee solo para el DID que ya vio
+    /// anunciado, así que publicarlo en sombra no interfiere.
+    pub dht_beacon: Option<Beacon>,
 }
 
 enum Command {
@@ -64,6 +73,10 @@ enum Command {
     },
     Status {
         reply: oneshot::Sender<NodeStatus>,
+    },
+    PutRecord {
+        key: Vec<u8>,
+        value: Vec<u8>,
     },
 }
 
@@ -136,6 +149,8 @@ pub struct NodeHandle {
     commands: mpsc::Sender<Command>,
     control: libp2p_stream::Control,
     connected: watch::Receiver<HashSet<PeerId>>,
+    /// Se avisa en cada conexión nueva (el TS se anuncia en `peer:connect`).
+    peer_connected: Arc<Notify>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -171,6 +186,11 @@ impl NodeHandle {
         let (reply, rx) = oneshot::channel();
         self.commands.send(Command::Status { reply }).await.ok()?;
         rx.await.ok()
+    }
+
+    /// Guarda un registro en el DHT (quórum 1); el resultado va al log.
+    pub async fn put_record(&self, key: Vec<u8>, value: Vec<u8>) {
+        let _ = self.commands.send(Command::PutRecord { key, value }).await;
     }
 
     pub fn is_connected(&self, peer: &PeerId) -> bool {
@@ -260,6 +280,7 @@ pub fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         commands,
         control,
         connected,
+        peer_connected: Arc::new(Notify::new()),
     };
     let (listen_tx, listen_rx) = watch::channel(Vec::<Multiaddr>::new());
 
@@ -272,11 +293,20 @@ pub fn start(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         connections: HashMap::new(),
         connected: connected_tx,
         listen_addrs: listen_tx,
+        peer_connected: handle.peer_connected.clone(),
     };
     tokio::spawn(actor.run(rx));
 
     for addr in config.bootstrap.iter().cloned() {
         tokio::spawn(bootstrap_loop(handle.clone(), addr));
+    }
+    if let Some(beacon) = config.dht_beacon {
+        tokio::spawn(dht_beacon_loop(
+            handle.clone(),
+            beacon,
+            config.announce.clone(),
+            listen_rx.clone(),
+        ));
     }
     if let Some(beacon) = config.advertise {
         tokio::spawn(advertise_loop(
@@ -305,6 +335,7 @@ struct Actor {
     connections: HashMap<ConnectionId, OpenConnection>,
     connected: watch::Sender<HashSet<PeerId>>,
     listen_addrs: watch::Sender<Vec<Multiaddr>>,
+    peer_connected: Arc<Notify>,
 }
 
 impl Actor {
@@ -349,6 +380,17 @@ impl Actor {
             }
             Command::Status { reply } => {
                 let _ = reply.send(self.status());
+            }
+            Command::PutRecord { key, value } => {
+                let record = kad::Record::new(key, value);
+                if let Err(error) = self
+                    .swarm
+                    .behaviour_mut()
+                    .kad
+                    .put_record(record, kad::Quorum::One)
+                {
+                    tracing::warn!("no se pudo guardar el registro DHT: {error:?}");
+                }
             }
         }
     }
@@ -396,6 +438,7 @@ impl Actor {
                 if let Some(reply) = self.pending_dials.remove(&connection_id) {
                     let _ = reply.send(Ok(peer_id));
                 }
+                self.peer_connected.notify_one();
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
@@ -438,10 +481,25 @@ impl Actor {
                 info,
                 ..
             })) => {
-                for addr in info.listen_addrs {
-                    self.swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                // Solo pares que sirven Kademlia (Atlas); los clientes (Portal,
+                // providers) no responden consultas y solo las retrasarían.
+                if info.protocols.contains(&kad::PROTOCOL_NAME) {
+                    for addr in info.listen_addrs {
+                        self.swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                    }
                 }
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::OutboundQueryProgressed {
+                result: kad::QueryResult::PutRecord(result),
+                step,
+                ..
+            })) if step.last => match result {
+                Ok(ok) => tracing::info!(
+                    "registro DHT guardado: {}",
+                    String::from_utf8_lossy(ok.key.as_ref())
+                ),
+                Err(error) => tracing::warn!("no se pudo guardar el registro DHT: {error}"),
+            },
             _ => {}
         }
     }
@@ -571,7 +629,52 @@ async fn bootstrap_loop(handle: NodeHandle, addr: Multiaddr) {
     }
 }
 
-/// Publica el `NodeAdvertise` firmado cada 30 s (y al tener direcciones).
+/// Direcciones propias a anunciar, con `/p2p/<id>`.
+fn own_addrs(
+    announce: &[Multiaddr],
+    listen: &watch::Receiver<Vec<Multiaddr>>,
+    peer: PeerId,
+) -> Vec<String> {
+    let addrs = if announce.is_empty() {
+        listen.borrow().clone()
+    } else {
+        announce.to_vec()
+    };
+    addrs
+        .into_iter()
+        .map(|a| with_peer_id(a, peer).to_string())
+        .collect()
+}
+
+/// Publica el `DhtBeaconRecord` firmado al conectar con un bootstrap y cada
+/// 30 min. Si falla, el Portal usa las direcciones del anuncio GossipSub.
+async fn dht_beacon_loop(
+    handle: NodeHandle,
+    beacon: Beacon,
+    announce: Vec<Multiaddr>,
+    listen: watch::Receiver<Vec<Multiaddr>>,
+) {
+    let peer = handle.identity.peer_id;
+    let mut connected = handle.connected.clone();
+    loop {
+        if connected.wait_for(|set| !set.is_empty()).await.is_err() {
+            return;
+        }
+        // Dar tiempo a identify para llenar la tabla de Kademlia.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let record = wire::signed_dht_beacon(
+            &handle.identity,
+            beacon.clone(),
+            own_addrs(&announce, &listen, peer),
+        );
+        handle
+            .put_record(wire::dht_beacon_key(&handle.identity.did), record)
+            .await;
+        tokio::time::sleep(DHT_REPUBLISH_INTERVAL).await;
+    }
+}
+
+/// Publica el `NodeAdvertise` firmado cada 30 s y tras cada conexión nueva.
 async fn advertise_loop(
     handle: NodeHandle,
     beacon: Beacon,
@@ -591,15 +694,13 @@ async fn advertise_loop(
     }
     let mut interval = tokio::time::interval(ADVERTISE_INTERVAL);
     loop {
-        interval.tick().await;
-        let addrs: Vec<String> = if announce.is_empty() {
-            listen.borrow().clone()
-        } else {
-            announce.clone()
+        tokio::select! {
+            _ = interval.tick() => {}
+            () = handle.peer_connected.notified() => {
+                tokio::time::sleep(ADVERTISE_ON_CONNECT_DELAY).await;
+            }
         }
-        .into_iter()
-        .map(|a| with_peer_id(a, peer).to_string())
-        .collect();
+        let addrs = own_addrs(&announce, &listen, peer);
         let bytes = wire::signed_node_advertise(
             &handle.identity,
             beacon.clone(),

@@ -19,7 +19,8 @@ Bastion con reversa. Hasta entonces el Navigator TS sigue en producción.
 | Identidad Ed25519 → PeerId + `did:key` (mismo archivo que el TS) | `p2p/identity.rs` |
 | Transporte WSS+TLS, Noise, yamux; TLS con pin del certificado del lab | `p2p/tls.rs`, `vendor/libp2p-websocket` |
 | Nodo: GossipSub, Kademlia (cliente), identify, ping, streams `/fhs/v1/0.1.0`, reconexión al bootstrap | `p2p/node.rs` |
-| `NodeAdvertise` firmados → caché con TTL | `p2p/peer_cache.rs`, `p2p/wire.rs` |
+| `NodeAdvertise` firmados → caché con TTL; anuncio propio cada 30 s y tras cada conexión nueva | `p2p/peer_cache.rs`, `p2p/wire.rs` |
+| Beacon firmado en el DHT (`/fhs/beacon/<did>`), republicado cada 30 min | `p2p/node.rs`, `p2p/wire.rs` |
 | offer / bid / assign firmados y elección del ganador | `p2p/mission.rs` |
 | Misiones de chat (con streaming de deltas) y de tools | `p2p/client.rs` |
 | Firmas y framing de Envelopes (verificación sobre bytes crudos) | `signing.rs`, `p2p/framing.rs` |
@@ -32,7 +33,6 @@ Pendiente, sin bloquear el cambio:
 
 - Cada misión espera el plazo de pujas (2 s); una pregunta con KB tarda
   14–30 s en el laboratorio.
-- No publica el beacon en el DHT (el Portal lo encuentra por GossipSub).
 - Artefactos solo en línea (sin IPFS).
 
 ## Configuración

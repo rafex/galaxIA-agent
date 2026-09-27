@@ -46,6 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         advertise: config
             .advertise_as_navigator
             .then(|| p2p::wire::navigator_beacon("Navigator FHS")),
+        dht_beacon: Some(p2p::wire::navigator_beacon("Navigator FHS")),
     })?;
     if !config.advertise_as_navigator {
         tracing::info!(

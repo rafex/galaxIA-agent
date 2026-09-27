@@ -18,7 +18,7 @@ producción en Bastion.
 | Streaming de Star al Portal | ✅ desde E2E-030 | ✅ |
 | `chatCancel` aborta el turno | ❌ | ✅ |
 | Apagado limpio con SIGTERM | ❌ | ✅ |
-| Beacon en el DHT | ✅ (put con timeouts) | ❌ (el Portal usa GossipSub) |
+| Beacon en el DHT | ❌ el put agota el tiempo y el registro va sin firma, que el Portal descarta | ✅ firmado, guardado en Atlas |
 | IDL | vía SDK | ✅ idéntico, verificado por sha256 |
 
 ## Lo que no hay que copiar del TS
@@ -96,8 +96,8 @@ Encontrado en el camino y **no** copiado del TS: `queryRagContext` espera
 nunca aportó contexto. El Rust lee el arreglo.
 
 Pendiente, sin bloquear la fase 5: cada misión espera los 2 s del plazo de
-pujas (una pregunta con KB tarda 14–30 s), no hay beacon en el DHT y los
-artefactos solo viajan en línea (sin IPFS).
+pujas (una pregunta con KB tarda 14–30 s) y los artefactos solo viajan en
+línea (sin IPFS).
 
 ## Fase 5: cambio en Bastion
 
