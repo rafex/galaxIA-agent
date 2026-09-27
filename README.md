@@ -4,19 +4,34 @@ Agente soberano de Navigator implementado en Rust sobre [Rig 0.42.0](https://doc
 
 ## Estado de la implementación
 
-Esta primera entrega contiene la base ejecutable y testeable del corte controlado:
+**Todavía no reemplaza al Navigator TS** (`galaxIA-Core/apps/navigator`),
+que sigue en producción. Evaluación completa y plan por fases en
+[`docs/migracion-desde-ts.md`](docs/migracion-desde-ts.md).
 
-- supervisor multiagente con `PolicyAgent`, `DocumentAgent`, `RetrievalAgent`,
-  `MissionManager` y `ResponseAgent`;
-- `RequestPlan` determinista: scope, RAG, límite de contexto y tres rondas máximas.
-- Snapshot de providers compatible con discovery de Atlas.
-- `MissionOffer → bid/selección → assign → ejecución`, con timeout y failover.
-- IDL FHS canónico completo versionado en `protocol/fhs-protocol.proto` y generado con `prost`.
-- `StarCompletionModel`, un adaptador Rig `CompletionModel` que solo habla con Star mediante `FhsTransport`.
-- herramientas remotas Rig dinámicas para capabilities anunciadas por Satellites.
-- API HTTP/WebSocket mínima de transición en `8090`.
+Hecho y probado:
 
-La implementación productiva de libp2p FHS, la lectura real del snapshot Atlas y la traducción de todos los eventos al stream Portal son los siguientes cortes de integración; no se simulan como llamadas directas a `llama.cpp`.
+- supervisor multiagente como módulos de un solo binario (`PolicyAgent`,
+  `DocumentAgent`, `RetrievalAgent`, `MissionManager`, `ResponseAgent`);
+- `RequestPlan` determinista: scope, fuente de RAG, límites de contexto (en
+  caracteres, con rechazo de OCR completo) y tres rondas máximas de tools;
+- filtro de providers por scope, orden por reputación/latencia y failover
+  local al siguiente provider;
+- IDL FHS canónico en `protocol/fhs-protocol.proto`, idéntico al de
+  `galaxIA` (`scripts/check-idl.sh`) y generado con `prost`;
+- `StarCompletionModel`, adaptador Rig `CompletionModel` hacia Star a través
+  del trait `FhsTransport`.
+
+Pendiente (no existe todavía):
+
+- **transporte libp2p**: el único `FhsTransport` es
+  `UnconfiguredFhsTransport`, que siempre falla;
+- lectura real de providers: `AtlasClient` es un snapshot en memoria que
+  nadie llena, así que `POST /v1/chat` responde "no hay providers";
+- offer/bid/assign por GossipSub, stream directo y handshake firmados;
+- sesión del Portal por libp2p (`/ws` acepta la conexión y la cierra);
+- OCR, RAG por red, recomendación de KB y procedencia;
+- el adaptador de Rig envía el historial como un solo mensaje JSON y sin
+  tools; `RemoteToolFactory` existe pero no se registra.
 
 La responsabilidad de cada agente y sus límites de autoridad están descritos
 en [`docs/arquitectura-multiagente.md`](docs/arquitectura-multiagente.md).

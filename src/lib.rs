@@ -8,6 +8,7 @@ pub mod policy;
 pub mod protocol;
 pub mod response;
 pub mod retrieval;
+pub mod signing;
 pub mod star;
 pub mod tools;
 

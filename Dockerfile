@@ -1,4 +1,9 @@
-FROM docker.io/library/rust:1.85-bookworm AS build
+# rig-core 0.42 usa la edición 2024; se fija la misma toolchain con la que se
+# desarrolla y prueba. prost-build necesita protoc del sistema.
+FROM docker.io/library/rust:1.97-bookworm AS build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends protobuf-compiler \
+ && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY protocol ./protocol

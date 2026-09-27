@@ -169,20 +169,25 @@ impl RequestPlan {
         if request.message.trim().is_empty() {
             return Err(PolicyError::EmptyMessage);
         }
-        let context_chars: usize = request
-            .document_context
-            .iter()
-            .map(|chunk| chunk.text.len())
-            .sum();
-        if context_chars > request.preferences.max_context_chars {
-            return Err(PolicyError::ContextTooLarge);
-        }
+        // Primero el tope por fragmento: un solo fragmento que por sí mismo
+        // excede el límite es un documento completo (OCR entero), no un
+        // fragmento recuperado. Si se revisara antes el total, esta regla
+        // nunca se alcanzaría. Se cuentan caracteres, no bytes (UTF-8).
+        let max_chars = request.preferences.max_context_chars;
         if request
             .document_context
             .iter()
-            .any(|chunk| chunk.text.len() > request.preferences.max_context_chars)
+            .any(|chunk| chunk.text.chars().count() > max_chars)
         {
             return Err(PolicyError::FullOcrRejected);
+        }
+        let context_chars: usize = request
+            .document_context
+            .iter()
+            .map(|chunk| chunk.text.chars().count())
+            .sum();
+        if context_chars > max_chars {
+            return Err(PolicyError::ContextTooLarge);
         }
         Ok(Self {
             conversation_id: request.conversation_id,
@@ -247,6 +252,48 @@ mod tests {
             score: 0.9,
             source: None,
         }];
+        assert!(RequestPlan::build(req).is_ok());
+    }
+
+    fn chunk(text: &str) -> DocumentChunk {
+        DocumentChunk {
+            chunk_id: text.chars().take(8).collect(),
+            filename: "x.pdf".into(),
+            chunk_index: 0,
+            text: text.into(),
+            score: 0.9,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn rejects_a_single_chunk_larger_than_the_limit_as_full_ocr() {
+        let mut req = request();
+        req.preferences.max_context_chars = 20;
+        req.document_context = vec![chunk("este fragmento es demasiado largo para el límite")];
+        assert!(matches!(
+            RequestPlan::build(req),
+            Err(PolicyError::FullOcrRejected)
+        ));
+    }
+
+    #[test]
+    fn rejects_many_small_chunks_that_exceed_the_total() {
+        let mut req = request();
+        req.preferences.max_context_chars = 20;
+        req.document_context = vec![chunk("doce letras"), chunk("otras doce!!")];
+        assert!(matches!(
+            RequestPlan::build(req),
+            Err(PolicyError::ContextTooLarge)
+        ));
+    }
+
+    #[test]
+    fn counts_characters_not_utf8_bytes() {
+        let mut req = request();
+        // 10 caracteres acentuados = 20 bytes en UTF-8; caben en un límite de 10.
+        req.preferences.max_context_chars = 10;
+        req.document_context = vec![chunk("áéíóúáéíóú")];
         assert!(RequestPlan::build(req).is_ok());
     }
 

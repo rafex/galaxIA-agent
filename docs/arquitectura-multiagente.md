@@ -51,8 +51,9 @@ los agentes posteriores reciben como contrato de ejecución.
 
 ### DocumentAgent
 
-Controla la frontera de documentos. Valida referencias, digests, tamaños y
-fragmentos ya recuperados. La extracción OCR pertenece al Satellite OCR y se
+Controla la frontera de documentos. Valida tamaños de adjuntos y que cada
+fragmento recuperado tenga `chunkId`. (Objetivo, aún no implementado:
+verificar digests de adjuntos.) La extracción OCR pertenece al Satellite OCR y se
 coordina mediante una Mission FHS.
 
 Regla obligatoria: el OCR completo nunca entra al prompt. El agente solo
@@ -102,6 +103,9 @@ SupervisorAgent
   ▼
 Respuesta + procedencia + eventos Portal
 ```
+
+Este es el flujo **objetivo**: hoy no hay transporte FHS, así que los pasos 3
+y 5 no se ejecutan contra la red (ver README, "Pendiente").
 
 El flujo de RAG local omite la Mission OCR/RAG de red cuando el navegador ya
 entregó los fragmentos. El flujo de RAG de GalaxIA crea Missions hacia los
