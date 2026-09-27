@@ -64,6 +64,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("probe") {
+        return probe(&node, &args[1..]).await;
+    }
+
     let agent = SovereignAgent::new(
         AtlasClient::default(),
         Arc::new(UnconfiguredFhsTransport),
@@ -176,4 +181,97 @@ async fn chat(
         Ok(content) => Json(json!({"content": content})),
         Err(error) => Json(json!({"error": error})),
     }
+}
+
+/// `galaxia-agent probe chat "<texto>"` · `probe tool <capability> <tool> '<json>'`:
+/// ejecuta una misión real contra la red y termina (diagnóstico).
+async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use galaxia_agent::p2p::{client, dynamic};
+    use galaxia_agent::protocol::fhs::Message;
+    use std::io::Write;
+
+    let started = std::time::Instant::now();
+    while node.peers.all().is_empty() && started.elapsed() < Duration::from_secs(45) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // Un ciclo más para que la malla de misiones esté lista.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("providers conocidos: {}", node.peers.all().len());
+    match args.first().map(String::as_str) {
+        Some("chat") => {
+            let text = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "Hola, ¿quién eres?".into());
+            let t0 = std::time::Instant::now();
+            let mut first: Option<Duration> = None;
+            let outcome = client::chat(
+                node,
+                client::ChatRequest {
+                    messages: vec![
+                        Message {
+                            role: "system".into(),
+                            content: "Responde en español, breve.".into(),
+                            ..Default::default()
+                        },
+                        Message {
+                            role: "user".into(),
+                            content: text,
+                            ..Default::default()
+                        },
+                    ],
+                    tools: vec![],
+                    model: String::new(),
+                    preferred_provider: None,
+                    timeout: Duration::from_secs(300),
+                },
+                |delta| {
+                    first.get_or_insert(t0.elapsed());
+                    print!("{delta}");
+                    let _ = std::io::stdout().flush();
+                },
+            )
+            .await?;
+            println!(
+                "\n— Star {} · primer delta {:?} · total {:?}",
+                outcome.provider,
+                first,
+                t0.elapsed()
+            );
+        }
+        Some("tool") => {
+            let capability = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "knowledge.query".into());
+            let tool = args.get(2).cloned().unwrap_or_else(|| "kb_query".into());
+            let json: serde_json::Value =
+                serde_json::from_str(args.get(3).map(String::as_str).unwrap_or("{}"))?;
+            let outcome = client::call_tool(
+                node,
+                client::ToolRequest {
+                    capability,
+                    tool_name: tool,
+                    arguments: dynamic::from_json(&json)?,
+                    preferred_provider: None,
+                    timeout: Duration::from_secs(120),
+                },
+            )
+            .await?;
+            let result = outcome
+                .result
+                .as_ref()
+                .map(dynamic::to_json)
+                .unwrap_or_default();
+            println!(
+                "— Satellite {}\n{}",
+                outcome.provider,
+                serde_json::to_string_pretty(&result)?
+            );
+        }
+        _ => println!(
+            "uso: galaxia-agent probe chat \"texto\" | probe tool <capability> <tool> '<json>'"
+        ),
+    }
+    Ok(())
 }
