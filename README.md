@@ -21,14 +21,14 @@ Navigator (runtime, sesión del Portal, adaptador Rig).
 
 | Pieza | Módulo |
 |---|---|
-| Identidad Ed25519 → PeerId + `did:key` (mismo archivo que el TS) | `fhs::p2p/identity.rs` |
-| Transporte WSS+TLS, Noise, yamux; TLS con pin del certificado del lab | `fhs::p2p/tls.rs`, `fhs::vendor/libp2p-websocket` |
-| Nodo: GossipSub, Kademlia (cliente), identify, ping, streams `/fhs/v1/0.1.0`, reconexión al bootstrap | `fhs::p2p/node.rs` |
-| `NodeAdvertise` firmados → caché con TTL; anuncio propio cada 30 s y tras cada conexión nueva | `fhs::p2p/peer_cache.rs`, `fhs::p2p/wire.rs` |
-| Beacon firmado en el DHT (`/fhs/beacon/<did>`), republicado cada 30 min | `fhs::p2p/node.rs`, `fhs::p2p/wire.rs` |
-| offer / bid / assign firmados y elección del ganador | `fhs::p2p/mission.rs` |
-| Misiones de chat (con streaming de deltas) y de tools | `fhs::p2p/client.rs` |
-| Firmas y framing de Envelopes (verificación sobre bytes crudos) | `fhs::signing.rs`, `fhs::p2p/framing.rs` |
+| Identidad Ed25519 → PeerId + `did:key` (mismo archivo que el TS) | `p2p/identity.rs` (galaxia-fhs) |
+| Transporte WSS+TLS, Noise, yamux; TLS con pin del certificado del lab | `p2p/tls.rs` (galaxia-fhs), `vendor/libp2p-websocket` (galaxia-fhs) |
+| Nodo: GossipSub, Kademlia (cliente), identify, ping, streams `/fhs/v1/0.1.0`, reconexión al bootstrap | `p2p/node.rs` (galaxia-fhs) |
+| `NodeAdvertise` firmados → caché con TTL; anuncio propio cada 30 s y tras cada conexión nueva | `p2p/peer_cache.rs` (galaxia-fhs), `p2p/wire.rs` (galaxia-fhs) |
+| Beacon firmado en el DHT (`/fhs/beacon/<did>`), republicado cada 30 min | `p2p/node.rs` (galaxia-fhs), `p2p/wire.rs` (galaxia-fhs) |
+| offer / bid / assign firmados y elección del ganador | `p2p/mission.rs` (galaxia-fhs) |
+| Misiones de chat (con streaming de deltas) y de tools | `p2p/client.rs` (galaxia-fhs) |
+| Firmas y framing de Envelopes (verificación sobre bytes crudos) | `signing.rs` (galaxia-fhs), `p2p/framing.rs` (galaxia-fhs) |
 | Turno del agente: OCR determinista con failover, recomendación y consulta de KB, RAG por red, una ronda de tools (como el TS), procedencia | `runtime/agent.rs`, `runtime/kb.rs`, `runtime/providers.rs` |
 | Adaptador Rig → Star (roles y tools reales, streaming) | `llm.rs` |
 | Sesión del Portal: handshake, `agentStart`, `chatRequest`, `kbDecision`, `chatCancel` con aborto real | `session.rs` |

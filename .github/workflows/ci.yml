@@ -17,5 +17,5 @@ jobs:
         with:
           version: '28.3'
       - run: cargo fmt --check
-      - run: ./scripts/check-idl.sh
+      # El IDL se verifica en galaxIA-SDK (rust/fhs/scripts/check-idl.sh).
       - run: cargo test --all-targets
