@@ -11,12 +11,15 @@ async-trait = "0.1"
 bs58 = "0.5"
 ed25519-dalek = "2"
 axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 futures = "0.3"
 hex = "0.4"
 libp2p = { version = "0.57", features = ["tokio", "tcp", "dns", "websocket", "noise", "yamux", "gossipsub", "kad", "identify", "ping", "macros", "ed25519"] }
 libp2p-stream = "0.5.0-alpha"
 prost = "0.13"
 rustls-pemfile = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 rig = { version = "=0.42.0", default-features = false, features = ["agent"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -36,3 +39,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Ver vendor/libp2p-websocket/GALAXIA-PATCH.md
+[patch.crates-io]
+libp2p-websocket = { path = "vendor/libp2p-websocket" }

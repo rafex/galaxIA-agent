@@ -1,12 +1,25 @@
 //! TLS de `/tls/ws` a partir de los PEM del laboratorio (`TLS_CERT_PATH`,
-//! `TLS_KEY_PATH`). El mismo certificado sirve para escuchar (el navegador
-//! se conecta con WSS) y se agrega como raíz de confianza para marcar a Atlas
-//! y a los providers, que usan el mismo certificado autofirmado
-//! (equivalente a `NODE_EXTRA_CA_CERTS` en el TS).
+//! `TLS_KEY_PATH`, `NODE_EXTRA_CA_CERTS`).
+//!
+//! - **Servidor:** certificado y llave del nodo, para que el navegador pueda
+//!   conectarse por WSS.
+//! - **Cliente:** cada certificado de confianza se agrega como raíz (sirve con
+//!   la PKI de `galaxIA-E2E`) **y** se fija (pinning). El certificado actual del
+//!   laboratorio es autofirmado con `CA:TRUE` y se usa como certificado de
+//!   servidor: webpki lo rechaza (`CaUsedAsEndEntity`) aunque Node lo acepta.
+//!   Un certificado fijado se acepta si es exactamente el mismo (DER), sin
+//!   dejar de verificar la firma del handshake TLS. La identidad del par la
+//!   garantiza además Noise (PeerId) por encima de TLS.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use libp2p::websocket::tls;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::WebPkiServerVerifier;
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, RootCertStore, SignatureScheme};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
@@ -29,7 +42,7 @@ fn read(path: &Path) -> Result<Vec<u8>, TlsError> {
 }
 
 /// Certificados DER de un archivo PEM.
-pub fn load_certs(path: &Path) -> Result<Vec<Vec<u8>>, TlsError> {
+pub fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, TlsError> {
     let pem = read(path)?;
     let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut pem.as_slice()).collect();
     let certs = certs.map_err(|e| TlsError::Pem {
@@ -42,13 +55,13 @@ pub fn load_certs(path: &Path) -> Result<Vec<Vec<u8>>, TlsError> {
             reason: "sin certificados".into(),
         });
     }
-    Ok(certs.into_iter().map(|c| c.to_vec()).collect())
+    Ok(certs)
 }
 
-/// Llave privada DER (PKCS#8, PKCS#1 o SEC1) de un archivo PEM.
-pub fn load_key(path: &Path) -> Result<Vec<u8>, TlsError> {
+/// Llave privada (PKCS#8, PKCS#1 o SEC1) de un archivo PEM.
+pub fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
     let pem = read(path)?;
-    let key = rustls_pemfile::private_key(&mut pem.as_slice())
+    rustls_pemfile::private_key(&mut pem.as_slice())
         .map_err(|e| TlsError::Pem {
             path: path.display().to_string(),
             reason: e.to_string(),
@@ -56,33 +69,120 @@ pub fn load_key(path: &Path) -> Result<Vec<u8>, TlsError> {
         .ok_or_else(|| TlsError::Pem {
             path: path.display().to_string(),
             reason: "sin llave privada".into(),
-        })?;
-    Ok(key.secret_der().to_vec())
+        })
 }
 
-/// Config TLS del transporte websocket: servidor (si hay llave) y confianza
-/// en los certificados dados, además de las raíces públicas.
+fn provider() -> Arc<CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// Acepta los certificados fijados tal cual; el resto, validación webpki.
+#[derive(Debug)]
+struct PinnedOrWebPki {
+    pinned: Vec<CertificateDer<'static>>,
+    webpki: Arc<WebPkiServerVerifier>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for PinnedOrWebPki {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if self
+            .pinned
+            .iter()
+            .any(|pinned| pinned.as_ref() == end_entity.as_ref())
+        {
+            return Ok(ServerCertVerified::assertion());
+        }
+        self.webpki
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Config TLS del transporte websocket: servidor (si hay certificado y llave)
+/// y cliente que confía en (y fija) los certificados de `trust`.
 pub fn websocket_config(
     cert_path: Option<&Path>,
     key_path: Option<&Path>,
     trust: &[&Path],
 ) -> Result<tls::Config, TlsError> {
-    let mut builder = tls::Config::builder();
-    if let (Some(cert_path), Some(key_path)) = (cert_path, key_path) {
-        let certs = load_certs(cert_path)?
-            .into_iter()
-            .map(tls::Certificate::new);
-        let key = tls::PrivateKey::new(load_key(key_path)?);
-        builder
-            .server(key, certs)
-            .map_err(|e| TlsError::Config(e.to_string()))?;
-    }
+    let provider = provider();
+
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut pinned = Vec::new();
     for path in trust {
-        for der in load_certs(path)? {
-            builder
-                .add_trust(&tls::Certificate::new(der))
-                .map_err(|e| TlsError::Config(e.to_string()))?;
+        for cert in load_certs(path)? {
+            // Como raíz puede fallar (p. ej. un certificado de servidor); el
+            // pinning cubre ese caso.
+            let _ = roots.add(cert.clone());
+            pinned.push(cert);
         }
     }
-    Ok(builder.finish())
+    let webpki = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+        .build()
+        .map_err(|e| TlsError::Config(e.to_string()))?;
+    let client = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| TlsError::Config(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedOrWebPki {
+            pinned,
+            webpki,
+            provider: provider.clone(),
+        }))
+        .with_no_client_auth();
+
+    let server = match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => Some(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| TlsError::Config(e.to_string()))?
+                .with_no_client_auth()
+                .with_single_cert(load_certs(cert_path)?, load_key(key_path)?)
+                .map_err(|e| TlsError::Config(e.to_string()))?,
+        ),
+        _ => None,
+    };
+    Ok(tls::Config::from_rustls(client, server))
 }

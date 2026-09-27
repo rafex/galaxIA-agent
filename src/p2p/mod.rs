@@ -3,6 +3,7 @@
 
 pub mod framing;
 pub mod identity;
+pub mod node;
 pub mod peer_cache;
 pub mod tls;
 pub mod wire;

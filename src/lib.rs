@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod atlas;
+pub mod config;
 pub mod document;
 pub mod events;
 pub mod fhs;
