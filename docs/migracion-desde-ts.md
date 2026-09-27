@@ -18,7 +18,7 @@ producción en Bastion.
 | Streaming de Star al Portal | ✅ desde E2E-030 | ✅ |
 | `chatCancel` aborta el turno | ❌ | ✅ |
 | Apagado limpio con SIGTERM | ❌ | ✅ |
-| Beacon en el DHT | ❌ el put agota el tiempo y el registro va sin firma, que el Portal descarta | ✅ firmado, guardado en Atlas |
+| Beacon en el DHT | ✅ desde E2E-032 (antes el put agotaba el tiempo) | ✅ firmado, guardado en Atlas |
 | IDL | vía SDK | ✅ idéntico, verificado por sha256 |
 
 ## Lo que no hay que copiar del TS
@@ -117,9 +117,11 @@ todavía no conocía a Star ni al RAG y fallaba; ahora, durante los primeros
 35 s, una búsqueda vacía espera el anuncio (`PeerCache::settle`). Con las
 pruebas lanzadas 2 s después del arranque pasan igual.
 
-El beacon del DHT no se prueba por defecto: el Rust lo guarda en Atlas, pero
-el cliente js-libp2p del Portal nunca completa la consulta (E2E-032, afecta
-también al TS). El Portal sigue con las direcciones del anuncio y pierde 3 s.
+El beacon del DHT: el Rust lo guardaba en Atlas, pero el Portal nunca
+completaba la consulta porque kad-dht de js-libp2p descarta por defecto las
+direcciones privadas y dejaba vacía su tabla de rutas (E2E-032, afectaba
+también al TS). Corregido en `galaxIA-Core` `3cd80fa`: el Portal lee el
+beacon firmado del Rust en ~1 s.
 El Portal no envía `chatCancel`, así que la cancelación no forma parte del
 flujo real.
 
