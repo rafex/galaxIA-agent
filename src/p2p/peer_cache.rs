@@ -4,7 +4,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::sync::Notify;
 
 use serde::Serialize;
 
@@ -94,12 +96,43 @@ fn peer_type(provider_type: i32) -> &'static str {
 /// perdido en la malla no debe sacarlo de la caché).
 const TTL_GRACE: Duration = Duration::from_secs(30);
 
-#[derive(Clone, Default)]
+/// Tras arrancar, un provider puede tardar hasta un ciclo de anuncios (30 s)
+/// en aparecer. Durante esta ventana una búsqueda vacía espera en vez de fallar.
+pub const WARM_UP: Duration = Duration::from_secs(35);
+
+#[derive(Clone)]
 pub struct PeerCache {
     inner: Arc<RwLock<HashMap<String, PeerEntry>>>,
+    started: Instant,
+    changed: Arc<Notify>,
+}
+
+impl Default for PeerCache {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            started: Instant::now(),
+            changed: Arc::new(Notify::new()),
+        }
+    }
 }
 
 impl PeerCache {
+    /// Espera a que `ready` se cumpla, solo mientras dure el arranque
+    /// ([`WARM_UP`]); después responde de inmediato.
+    pub async fn settle(&self, ready: impl Fn(&PeerCache) -> bool) {
+        loop {
+            let notified = self.changed.notified();
+            if ready(self) {
+                return;
+            }
+            let Some(left) = WARM_UP.checked_sub(self.started.elapsed()) else {
+                return;
+            };
+            let _ = tokio::time::timeout(left, notified).await;
+        }
+    }
+
     /// Registra un anuncio ya verificado. Devuelve false si no tiene DID.
     pub fn upsert(&self, message: &NodeAdvertiseMessage) -> bool {
         if message.did.is_empty() {
@@ -132,6 +165,7 @@ impl PeerCache {
             .write()
             .expect("peer cache")
             .insert(entry.did.clone(), entry);
+        self.changed.notify_waiters();
         true
     }
 
@@ -210,6 +244,29 @@ pub fn iso8601(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn settle_waits_during_warm_up_until_the_provider_appears() {
+        let cache = PeerCache::default();
+        let waiting = {
+            let cache = cache.clone();
+            tokio::spawn(async move { cache.settle(|p| !p.stars().is_empty()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiting.is_finished());
+        cache.upsert(&advertise("did:key:zStar", ProviderType::Star));
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("settle debe terminar al llegar el anuncio")
+            .unwrap();
+        // Ya listo: no espera.
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            cache.settle(|p| !p.stars().is_empty()),
+        )
+        .await
+        .unwrap();
+    }
 
     fn advertise(did: &str, provider_type: ProviderType) -> NodeAdvertiseMessage {
         NodeAdvertiseMessage {

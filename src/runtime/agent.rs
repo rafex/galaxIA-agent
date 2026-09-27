@@ -163,9 +163,13 @@ impl<'a> AgentRuntime<'a> {
         }
 
         self.status("resolving-model", "Eligiendo modelo");
+        self.settle_stars(preferences).await;
         let llm = self.resolve_llm(preferences)?;
 
         self.status("resolving-tools", "Buscando herramientas");
+        for capability in &capabilities {
+            self.settle_tools(capability, preferences).await;
+        }
         let mut tools = providers::tools_for(&self.node.peers, &capabilities, preferences.scope);
 
         let mut user_content = turn.message.clone();
@@ -327,6 +331,23 @@ impl<'a> AgentRuntime<'a> {
             },
         });
         Ok(answer)
+    }
+
+    /// Recién arrancado, los Stars pueden no haberse anunciado todavía.
+    async fn settle_stars(&self, preferences: &Preferences) {
+        let scope = preferences.scope;
+        self.node
+            .peers
+            .settle(|peers| !providers::stars(peers, scope).is_empty())
+            .await;
+    }
+
+    async fn settle_tools(&self, capability: &str, preferences: &Preferences) {
+        let scope = preferences.scope;
+        self.node
+            .peers
+            .settle(|peers| !providers::tools_for(peers, &[capability], scope).is_empty())
+            .await;
     }
 
     fn resolve_llm(&self, preferences: &Preferences) -> Result<ResolvedLlm, RuntimeError> {
@@ -547,6 +568,7 @@ impl<'a> AgentRuntime<'a> {
         artifact: &ArtifactRef,
         preferences: &Preferences,
     ) -> Result<(String, String), RuntimeError> {
+        self.settle_tools("document.ocr", preferences).await;
         let tools = providers::tools_for(&self.node.peers, &["document.ocr"], preferences.scope);
         if tools.is_empty() {
             return Err(RuntimeError::new(
@@ -574,6 +596,7 @@ impl<'a> AgentRuntime<'a> {
         document_id: Option<&str>,
         preferences: &Preferences,
     ) -> bool {
+        self.settle_tools("document.index", preferences).await;
         let Some(tool) =
             providers::tools_for(&self.node.peers, &["document.index"], preferences.scope)
                 .into_iter()
@@ -599,6 +622,7 @@ impl<'a> AgentRuntime<'a> {
         document_id: Option<&str>,
         labels: &[(String, String)],
     ) -> Option<String> {
+        self.settle_tools("document.query", preferences).await;
         let tool = providers::tools_for(&self.node.peers, &["document.query"], preferences.scope)
             .into_iter()
             .next()?;
@@ -706,6 +730,11 @@ impl<'a> AgentRuntime<'a> {
         question: &str,
         preferences: &Preferences,
     ) -> (Vec<KbCandidate>, bool) {
+        let scope = preferences.scope;
+        self.node
+            .peers
+            .settle(|peers| !providers::kb_providers(peers, scope).is_empty())
+            .await;
         let kbs = providers::kb_providers(&self.node.peers, preferences.scope);
         let mut scored: Vec<(f64, &providers::KbProvider)> = kbs
             .iter()
