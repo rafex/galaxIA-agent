@@ -4,6 +4,7 @@ pub mod document;
 pub mod events;
 pub mod fhs;
 pub mod mission;
+pub mod p2p;
 pub mod policy;
 pub mod protocol;
 pub mod response;
