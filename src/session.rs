@@ -335,11 +335,15 @@ fn handle_chat(
         s.session_id = Some(conversation.clone());
         (conversation, s.preferences.clone())
     };
-    let Some(last) = request.messages.last().filter(|m| m.role == "user") else {
+    let Some(last) = request
+        .messages
+        .last()
+        .filter(|m| m.role == "user" && !m.content.trim().is_empty())
+    else {
         let _ = tx.send(error_payload(
             &conversation,
             "INVALID_ARGUMENTS",
-            "El último mensaje debe ser del usuario",
+            "El último mensaje debe ser del usuario y no estar vacío",
         ));
         return;
     };

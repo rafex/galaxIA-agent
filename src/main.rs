@@ -1,26 +1,15 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use axum::{
-    extract::State,
-    response::IntoResponse,
-    routing::{get, post},
-    Json, Router,
-};
+use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 use galaxia_agent::{
-    agent::SovereignAgent,
-    atlas::AtlasClient,
     config::AgentConfig,
-    events::EventBus,
-    fhs::UnconfiguredFhsTransport,
     p2p::{self, identity::NodeIdentity, node::NodeHandle},
-    policy::AgentRequest,
 };
 use serde_json::{json, Value};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
 struct AppState {
-    agent: SovereignAgent<UnconfiguredFhsTransport>,
     node: NodeHandle,
     config: Arc<AgentConfig>,
 }
@@ -85,20 +74,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return probe(&node, &args[1..]).await;
     }
 
-    let agent = SovereignAgent::new(
-        AtlasClient::default(),
-        Arc::new(UnconfiguredFhsTransport),
-        EventBus::new(256),
-    );
     let state = AppState {
-        agent,
         node,
         config: config.clone(),
     };
     let app = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
-        .route("/v1/chat", post(chat))
         .with_state(state);
 
     let addr: SocketAddr = format!("{}:{}", config.http_host, config.http_port).parse()?;
@@ -186,17 +168,6 @@ async fn shutdown_signal() {
         () = terminate => {},
     }
     tracing::info!("apagando galaxia-agent");
-}
-
-/// Transición: se reemplaza por la sesión del Portal por libp2p.
-async fn chat(
-    State(state): State<AppState>,
-    Json(request): Json<AgentRequest>,
-) -> impl IntoResponse {
-    match state.agent.run(request).await {
-        Ok(content) => Json(json!({"content": content})),
-        Err(error) => Json(json!({"error": error})),
-    }
 }
 
 /// `galaxia-agent probe chat "<texto>"` · `probe tool <capability> <tool> '<json>'`:

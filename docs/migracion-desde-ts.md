@@ -4,19 +4,21 @@ Evaluación del 2026-09-27 (lectura de código de los dos repos) y plan para
 que `galaxIA-agent` reemplace a `galaxIA-Core/apps/navigator`, que sigue en
 producción en Bastion.
 
-## Dónde estamos
+## Dónde estamos (2026-09-27)
 
 | | Navigator TS | galaxIA-agent |
 |---|---|---|
-| Tamaño | 3,621 líneas + `packages/fhs-node` | ~1,300 líneas |
-| Transporte libp2p (WSS+TLS, Noise, yamux) | ✅ | ❌ sin dependencia libp2p |
-| Descubrimiento: `NodeAdvertise` firmado por GossipSub → PeerCache | ✅ | ❌ snapshot vacío |
-| offer / bid / assign firmados | ✅ | ❌ solo orden local |
-| Stream directo `/fhs/v1/0.1.0` + handshake + Envelope firmado | ✅ | ❌ |
-| Sesión del Portal por libp2p | ✅ | ❌ (`/ws` cierra al conectar) |
-| OCR determinista con failover, RAG por red, KB (SPEC-KB-0002), procedencia | ✅ | ❌ |
-| Streaming de Star al Portal | ✅ desde E2E-030 | ❌ (adaptador Rig con streaming simulado) |
-| Política (scope, límites, rondas) | ✅ | ✅ |
+| Tamaño | 3,621 líneas + `packages/fhs-node` | ~5,700 líneas (con tests) |
+| Transporte libp2p (WSS+TLS, Noise, yamux) | ✅ | ✅ |
+| Descubrimiento: `NodeAdvertise` firmado por GossipSub → caché | ✅ sin expiración | ✅ con TTL + 30 s de gracia |
+| offer / bid / assign firmados | ✅ | ✅ |
+| Stream directo `/fhs/v1/0.1.0` + handshake + Envelope firmado | ✅ | ✅ |
+| Sesión del Portal por libp2p | ✅ | ✅ |
+| OCR con failover, RAG por red, KB (SPEC-KB-0002), procedencia | ✅ (el RAG por red nunca aportó: ver abajo) | ✅ |
+| Streaming de Star al Portal | ✅ desde E2E-030 | ✅ |
+| `chatCancel` aborta el turno | ❌ | ✅ |
+| Apagado limpio con SIGTERM | ❌ | ✅ |
+| Beacon en el DHT | ✅ (put con timeouts) | ❌ (el Portal usa GossipSub) |
 | IDL | vía SDK | ✅ idéntico, verificado por sha256 |
 
 ## Lo que no hay que copiar del TS
@@ -45,10 +47,10 @@ binario hasta el cambio.
 | Fase | Qué | Compuerta |
 |---|---|---|
 | 0 ✅ | Fixtures dorados generados desde el TS: Envelopes, `NodeAdvertise`, offer/bid/assign firmados, `DynamicValue` (`tests/fixtures/wire.json`, generador en `galaxIA-Core/apps/navigator/scripts/export-wire-fixtures.ts`) | El Rust decodifica todo y verifica las firmas |
-| 1 | Nodo rust-libp2p observador: WSS+TLS, Noise, yamux, Kademlia, GossipSub, reconexión al bootstrap, PeerCache con TTL, `/status` | En Bastion ve los mismos providers que el TS |
-| 2 | Misión de chat a Star con streaming real; adaptador Rig con roles y tools reales | Un comando de prueba recibe deltas de Star |
-| 3 | Tools: OCR con failover al siguiente provider, RAG por red, KB (portar `kb-matching.ts` y sus tests), procedencia | Mismas preguntas del laboratorio, mismo resultado que TS |
-| 4 | Sesión del Portal por libp2p: todos los casos de `portal-session.ts` | El Portal funciona sin cambios contra el Rust |
+| 1 ✅ | Nodo rust-libp2p observador: WSS+TLS, Noise, yamux, Kademlia, GossipSub, reconexión al bootstrap, PeerCache con TTL, `/status` | En Bastion ve los mismos providers que el TS |
+| 2 ✅ | Misión de chat a Star con streaming real; adaptador Rig con roles y tools reales | Un comando de prueba recibe deltas de Star |
+| 3 ✅ | Tools: OCR con failover al siguiente provider, RAG por red, KB (portar `kb-matching.ts` y sus tests), procedencia | Mismas preguntas del laboratorio, mismo resultado que TS |
+| 4 ✅ | Sesión del Portal por libp2p: todos los casos de `portal-session.ts` | El Portal funciona sin cambios contra el Rust |
 | 5 | Cambio en Bastion con reversa (misma identidad `navigator-data`, imagen TS etiquetada) | `doctor.sh` en verde, chat/OCR/KB desde el navegador, reinicio de Bastion |
 
 ## Resultado de la fase 0 (2026-09-27)
@@ -70,6 +72,45 @@ binario hasta el cambio.
   codificación.
 - Regenerar los fixtures:
   `cd galaxIA-Core/apps/navigator && npx tsx scripts/export-wire-fixtures.ts ../../../galaxIA-agent/tests/fixtures/wire.json`
+
+## Resultado de las fases 1 a 4 (2026-09-27)
+
+Verificado desde el Mac contra el laboratorio (Atlas, Star, KB, RAG y OCR en
+TS), con el agente sin anunciarse como `navigator`:
+
+- **Fase 1.** Se une por WSS+TLS al Atlas de Bastion y ve a Star, KB, RAG y
+  OCR con sus firmas verificadas. El certificado del laboratorio es
+  autofirmado con `CA:TRUE` y rustls lo rechaza como certificado de hoja
+  (`CaUsedAsEndEntity`): se resolvió con un verificador que acepta el
+  certificado exacto de `NODE_EXTRA_CA_CERTS` (pin) y cae a webpki para el
+  resto. Hace falta una copia de `libp2p-websocket` 0.46.0 con
+  `tls::Config::from_rustls` (`vendor/libp2p-websocket/GALAXIA-PATCH.md`).
+- **Fase 2.** `probe chat` y `probe rig` reciben deltas reales de Star.
+- **Fase 3.** `probe tool` contra KB, RAG y OCR; `probe turn` recomienda la
+  KB, la consulta, fusiona con RAG y la respuesta cita el artículo 3.
+- **Fase 4.** `probe portal`: handshake → `kbRecommended` → `kbDecision` →
+  deltas → `assistantCompleted` con KB y RAG en la procedencia, en 14 s.
+
+Encontrado en el camino y **no** copiado del TS: `queryRagContext` espera
+`{chunks}` pero el RAG devuelve un arreglo, así que en el TS el RAG por red
+nunca aportó contexto. El Rust lee el arreglo.
+
+Pendiente, sin bloquear la fase 5: cada misión espera los 2 s del plazo de
+pujas (una pregunta con KB tarda 14–30 s), no hay beacon en el DHT y los
+artefactos solo viajan en línea (sin IPFS).
+
+## Fase 5: cambio en Bastion
+
+1. Construir la imagen en Bastion y etiquetar la del TS para volver
+   (`galaxia-navigator:ts-rollback`).
+2. Correrla en sombra: otra identidad, otros puertos, sin
+   `FHS_ADVERTISE_AS_NAVIGATOR`. Probar con `probe portal`.
+3. Cambio: detener `fhs-navigator` (TS) y arrancar el agente con el volumen
+   `navigator-data` (mismo DID y PeerId), los mismos puertos (4010, 8090),
+   `FHS_ADVERTISE_AS_NAVIGATOR=true` y `--restart always`.
+4. Compuerta: `doctor.sh` en verde; chat, OCR y KB desde el navegador; un
+   reinicio de Bastion.
+5. Reversa: detener el agente y arrancar de nuevo `fhs-navigator`.
 
 ## Coordinación
 

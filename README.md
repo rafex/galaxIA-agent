@@ -1,60 +1,85 @@
 # galaxIA-agent
 
-Agente soberano de Navigator implementado en Rust sobre [Rig 0.42.0](https://docs.rs/rig/0.42.0/rig/). El agente recibe una petición ya validada por su propia política, selecciona providers dentro del scope permitido y ejecuta Missions FHS hacia Star y Satellites.
+Navigator de galaxIA en Rust: se une a la red FHS por libp2p, atiende la
+sesión del Portal, subasta Missions entre Star y Satellites y arma la
+respuesta con KB, RAG y OCR. Usa [Rig 0.42.0](https://docs.rs/rig/0.42.0/rig/)
+como interfaz de `CompletionModel` hacia Star.
 
-## Estado de la implementación
+Es el reemplazo de `galaxIA-Core/apps/navigator` (TypeScript). Evaluación,
+fases y resultados en [`docs/migracion-desde-ts.md`](docs/migracion-desde-ts.md).
 
-**Todavía no reemplaza al Navigator TS** (`galaxIA-Core/apps/navigator`),
-que sigue en producción. Evaluación completa y plan por fases en
-[`docs/migracion-desde-ts.md`](docs/migracion-desde-ts.md).
+## Estado
 
-Hecho y probado:
+Fases 0 a 4 terminadas y verificadas contra el laboratorio (red js-libp2p
+real: Atlas, Star, KB, RAG y OCR en TS). Falta la fase 5: el cambio en
+Bastion con reversa. Hasta entonces el Navigator TS sigue en producción.
 
-- supervisor multiagente como módulos de un solo binario (`PolicyAgent`,
-  `DocumentAgent`, `RetrievalAgent`, `MissionManager`, `ResponseAgent`);
-- `RequestPlan` determinista: scope, fuente de RAG, límites de contexto (en
-  caracteres, con rechazo de OCR completo) y tres rondas máximas de tools;
-- filtro de providers por scope, orden por reputación/latencia y failover
-  local al siguiente provider;
-- IDL FHS canónico en `protocol/fhs-protocol.proto`, idéntico al de
-  `galaxIA` (`scripts/check-idl.sh`) y generado con `prost`;
-- `StarCompletionModel`, adaptador Rig `CompletionModel` hacia Star a través
-  del trait `FhsTransport`.
+| Pieza | Módulo |
+|---|---|
+| Identidad Ed25519 → PeerId + `did:key` (mismo archivo que el TS) | `p2p/identity.rs` |
+| Transporte WSS+TLS, Noise, yamux; TLS con pin del certificado del lab | `p2p/tls.rs`, `vendor/libp2p-websocket` |
+| Nodo: GossipSub, Kademlia (cliente), identify, ping, streams `/fhs/v1/0.1.0`, reconexión al bootstrap | `p2p/node.rs` |
+| `NodeAdvertise` firmados → caché con TTL | `p2p/peer_cache.rs`, `p2p/wire.rs` |
+| offer / bid / assign firmados y elección del ganador | `p2p/mission.rs` |
+| Misiones de chat (con streaming de deltas) y de tools | `p2p/client.rs` |
+| Firmas y framing de Envelopes (verificación sobre bytes crudos) | `signing.rs`, `p2p/framing.rs` |
+| Turno del agente: OCR determinista con failover, recomendación y consulta de KB, RAG por red, una ronda de tools (como el TS), procedencia | `runtime/agent.rs`, `runtime/kb.rs`, `runtime/providers.rs` |
+| Adaptador Rig → Star (roles y tools reales, streaming) | `llm.rs` |
+| Sesión del Portal: handshake, `agentStart`, `chatRequest`, `kbDecision`, `chatCancel` con aborto real | `session.rs` |
+| `/health` y `/status` con el formato del TS; apagado limpio con SIGTERM | `main.rs` |
 
-Pendiente (no existe todavía):
+Pendiente, sin bloquear el cambio:
 
-- **transporte libp2p**: el único `FhsTransport` es
-  `UnconfiguredFhsTransport`, que siempre falla;
-- lectura real de providers: `AtlasClient` es un snapshot en memoria que
-  nadie llena, así que `POST /v1/chat` responde "no hay providers";
-- offer/bid/assign por GossipSub, stream directo y handshake firmados;
-- sesión del Portal por libp2p (`/ws` acepta la conexión y la cierra);
-- OCR, RAG por red, recomendación de KB y procedencia;
-- el adaptador de Rig envía el historial como un solo mensaje JSON y sin
-  tools; `RemoteToolFactory` existe pero no se registra.
+- Cada misión espera el plazo de pujas (2 s); una pregunta con KB tarda
+  14–30 s en el laboratorio.
+- No publica el beacon en el DHT (el Portal lo encuentra por GossipSub).
+- Artefactos solo en línea (sin IPFS).
 
-La responsabilidad de cada agente y sus límites de autoridad están descritos
-en [`docs/arquitectura-multiagente.md`](docs/arquitectura-multiagente.md).
+## Configuración
 
-## Política de seguridad y contexto
+Las mismas variables que el Navigator TS:
 
-El LLM no elige privacidad, RAG, provider ni tamaño de prompt. El OCR completo no forma parte del `RequestPlan`: solo se aceptan fragmentos recuperados (`DocumentChunk`). La ruta oficial del modelo es Star/FHS. `llama.cpp` queda fuera de este repositorio y solo Star puede invocarlo.
+| Variable | Default |
+|---|---|
+| `IDENTITY_KEY_PATH` | `./.fhs-identity-navigator.json` |
+| `FHS_LISTEN_ADDRS` | `/ip4/0.0.0.0/tcp/4010/tls/ws` |
+| `FHS_ANNOUNCE_ADDRS`, `FHS_BOOTSTRAP_ADDRS` | vacío |
+| `TLS_CERT_PATH`, `TLS_KEY_PATH` | sin TLS en la API HTTP |
+| `NODE_EXTRA_CA_CERTS` | certificados de confianza adicionales |
+| `HOST`, `PORT` | `127.0.0.1`, `8090` |
+| `FHS_VETOED_PROVIDERS` | DIDs separados por coma |
+
+Y una propia: `FHS_ADVERTISE_AS_NAVIGATOR=true` hace que se anuncie como
+`navigator`. Por defecto es `false`, para poder correrlo junto al TS sin que
+el Portal lo tome.
 
 ## Desarrollo
 
 ```sh
 cargo fmt --check
-cargo check
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-El binario escucha en `0.0.0.0:8090` por defecto. Se puede cambiar con `GALAXIA_AGENT_BIND`.
+Pruebas contra una red real (el binario se une a la red y ejecuta una
+acción):
+
+```sh
+galaxia-agent probe chat "<pregunta>"
+galaxia-agent probe rig "<pregunta>"
+galaxia-agent probe tool <capability> <tool> '<json>'
+galaxia-agent probe turn "<pregunta>"
+galaxia-agent probe portal <multiaddr-del-agente> "<pregunta>"
+```
 
 ## Contenedor
 
 ```sh
 podman build -t galaxia-agent:dev .
-podman run --rm --network host -e GALAXIA_AGENT_BIND=0.0.0.0:8090 galaxia-agent:dev
+podman run -d --name galaxia-agent --network host --restart always \
+  -v navigator-data:/data -e IDENTITY_KEY_PATH=/data/identity.json \
+  -e FHS_BOOTSTRAP_ADDRS=... -e FHS_ANNOUNCE_ADDRS=... \
+  galaxia-agent:dev
 ```
 
-El contenedor no instala ni ejecuta `llama.cpp`; el adaptador FHS necesita conectarse al Star anunciado por la red.
+El contenedor no incluye `llama.cpp`: solo Star lo invoca.
