@@ -190,12 +190,13 @@ async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::er
     use galaxia_agent::protocol::fhs::Message;
     use std::io::Write;
 
+    // Un ciclo completo de anuncios (cada provider se anuncia cada 30 s).
     let started = std::time::Instant::now();
-    while node.peers.all().is_empty() && started.elapsed() < Duration::from_secs(45) {
+    while started.elapsed() < Duration::from_secs(35)
+        && !(!node.peers.stars().is_empty() && node.peers.satellites().len() >= 3)
+    {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    // Un ciclo más para que la malla de misiones esté lista.
-    tokio::time::sleep(Duration::from_secs(3)).await;
     println!("providers conocidos: {}", node.peers.all().len());
     match args.first().map(String::as_str) {
         Some("chat") => {
@@ -238,6 +239,51 @@ async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::er
                 first,
                 t0.elapsed()
             );
+        }
+        Some("turn") => {
+            use galaxia_agent::runtime::{
+                agent::{AgentRuntime, Preferences, Turn},
+                events::{AgentEvent, EventSink},
+            };
+            struct Printer;
+            impl EventSink for Printer {
+                fn emit(&self, event: AgentEvent) {
+                    match event {
+                        AgentEvent::AssistantDelta { text } => {
+                            print!("{text}");
+                            let _ = std::io::stdout().flush();
+                        }
+                        other => println!("  · {other:?}"),
+                    }
+                }
+            }
+            let question = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "¿Qué dice el artículo 3 sobre la educación?".into());
+            let printer = Printer;
+            let preferences = Preferences::default();
+            let mut runtime = AgentRuntime::new(node.clone(), &printer, "probe-conv");
+            let (candidates, by_llm) = runtime.resolve_kb_candidates(&question, &preferences).await;
+            println!(
+                "KB recomendadas (por LLM: {by_llm}): {:?}",
+                candidates
+                    .iter()
+                    .map(|c| &c.provider_name)
+                    .collect::<Vec<_>>()
+            );
+            let t0 = std::time::Instant::now();
+            let answer = runtime
+                .run(
+                    Turn {
+                        message: question,
+                        kb_provider_ids: candidates.iter().map(|c| c.provider_id.clone()).collect(),
+                        ..Default::default()
+                    },
+                    &preferences,
+                )
+                .await?;
+            println!("\n— {} caracteres · {:?}", answer.len(), t0.elapsed());
         }
         Some("rig") => {
             use galaxia_agent::llm;

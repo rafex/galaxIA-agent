@@ -159,10 +159,8 @@ pub fn content_tokens(text: &str) -> Vec<String> {
             continue;
         }
         let numeric = token.chars().all(|c| c.is_numeric());
-        if token.chars().count() > 1 || numeric {
-            if seen.insert(token.to_string()) {
-                out.push(token.to_string());
-            }
+        if (token.chars().count() > 1 || numeric) && seen.insert(token.to_string()) {
+            out.push(token.to_string());
         }
     }
     out
