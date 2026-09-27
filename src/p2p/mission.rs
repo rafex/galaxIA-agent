@@ -1,6 +1,7 @@
 //! Ciclo de misión: offer → bids → selección → assign (`mission-cycle.ts`).
 
 use std::time::Duration;
+use std::time::Instant;
 
 use uuid::Uuid;
 
@@ -78,10 +79,12 @@ pub async fn run_mission_cycle(
         let bids = node.bids.clone();
         let id = mission_id.clone();
         let deadline = request.bid_deadline;
-        tokio::spawn(async move { bids.collect(&id, deadline).await })
+        let preferred = request.preferred_provider.clone();
+        tokio::spawn(async move { bids.collect(&id, deadline, preferred).await })
     };
     // La ventana se abre antes de publicar para no perder pujas rápidas.
     tokio::task::yield_now().await;
+    let bid_wait_started = Instant::now();
     node.publish(
         TOPIC_MISSIONS_OFFER,
         wire::signed_mission_offer(&node.identity, offer),
@@ -94,8 +97,11 @@ pub async fn run_mission_cycle(
 
     let bids = collecting.await.unwrap_or_default();
     tracing::info!(
-        "[mission] {} bid(s) recibidos para {mission_id}",
-        bids.len()
+        mission_id = %mission_id,
+        bid_count = bids.len(),
+        bid_wait_ms = bid_wait_started.elapsed().as_millis() as u64,
+        preferred_provider = %request.preferred_provider.as_deref().unwrap_or("none"),
+        "[mission] bids collected",
     );
     let winner = select_winning_bid(&bids, request.preferred_provider.as_deref())?.clone();
 

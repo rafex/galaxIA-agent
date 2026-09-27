@@ -111,29 +111,70 @@ pub struct NodeStatus {
 /// Pujas recibidas por misión mientras su ventana está abierta.
 #[derive(Clone, Default)]
 pub struct BidCollector {
-    open: Arc<Mutex<HashMap<String, Vec<MissionBidMessage>>>>,
+    open: Arc<Mutex<HashMap<String, OpenBidWindow>>>,
+}
+
+#[derive(Default)]
+struct OpenBidWindow {
+    bids: Vec<MissionBidMessage>,
+    preferred_provider: Option<String>,
+    changed: Arc<Notify>,
 }
 
 impl BidCollector {
-    /// Abre la ventana, espera `deadline` y devuelve las pujas recibidas.
-    pub async fn collect(&self, mission_id: &str, deadline: Duration) -> Vec<MissionBidMessage> {
-        self.open
-            .lock()
-            .expect("bids")
-            .insert(mission_id.to_string(), Vec::new());
-        tokio::time::sleep(deadline).await;
+    /// Abre la ventana hasta `deadline`; puede cerrar antes si llega el
+    /// provider preferido, que por regla de selección ya es el ganador.
+    pub async fn collect(
+        &self,
+        mission_id: &str,
+        deadline: Duration,
+        preferred_provider: Option<String>,
+    ) -> Vec<MissionBidMessage> {
+        self.open.lock().expect("bids").insert(
+            mission_id.to_string(),
+            OpenBidWindow {
+                bids: Vec::new(),
+                preferred_provider,
+                changed: Arc::new(Notify::new()),
+            },
+        );
+        let cutoff = tokio::time::Instant::now() + deadline;
+        loop {
+            let changed = {
+                let open = self.open.lock().expect("bids");
+                let Some(window) = open.get(mission_id) else {
+                    break;
+                };
+                let preferred_arrived =
+                    window.preferred_provider.as_ref().is_some_and(|preferred| {
+                        window.bids.iter().any(|bid| &bid.provider_did == preferred)
+                    });
+                if preferred_arrived {
+                    break;
+                }
+                window.changed.clone()
+            };
+            if tokio::time::timeout_at(cutoff, changed.notified())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
         self.open
             .lock()
             .expect("bids")
             .remove(mission_id)
+            .map(|window| window.bids)
             .unwrap_or_default()
     }
 
     /// Entrega una puja; las de misiones sin ventana abierta se descartan.
     pub fn deliver(&self, bid: MissionBidMessage) -> bool {
         match self.open.lock().expect("bids").get_mut(&bid.mission_id) {
-            Some(bids) => {
-                bids.push(bid);
+            Some(window) => {
+                window.bids.push(bid);
+                window.changed.notify_one();
                 true
             }
             None => false,
@@ -724,7 +765,7 @@ mod tests {
         }));
         let collecting = {
             let bids = bids.clone();
-            tokio::spawn(async move { bids.collect("m1", Duration::from_millis(50)).await })
+            tokio::spawn(async move { bids.collect("m1", Duration::from_millis(50), None).await })
         };
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(bids.deliver(MissionBidMessage {
@@ -738,6 +779,39 @@ mod tests {
             mission_id: "m1".into(),
             ..Default::default()
         }));
+    }
+
+    #[tokio::test]
+    async fn preferred_provider_bid_closes_the_window_without_waiting_for_deadline() {
+        let bids = BidCollector::default();
+        let started = Instant::now();
+        let collecting = {
+            let bids = bids.clone();
+            tokio::spawn(async move {
+                bids.collect(
+                    "preferred-mission",
+                    Duration::from_secs(2),
+                    Some("did:key:zPreferred".into()),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(bids.deliver(MissionBidMessage {
+            mission_id: "preferred-mission".into(),
+            provider_did: "did:key:zOther".into(),
+            ..Default::default()
+        }));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(bids.deliver(MissionBidMessage {
+            mission_id: "preferred-mission".into(),
+            provider_did: "did:key:zPreferred".into(),
+            ..Default::default()
+        }));
+
+        let got = collecting.await.unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
