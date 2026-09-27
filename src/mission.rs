@@ -27,11 +27,59 @@ pub enum MissionError {
     Exhausted,
     #[error("timeout esperando respuesta del provider")]
     Timeout,
+    #[error("el provider falló: {0}")]
+    Provider(String),
+}
+
+/// Agente determinista que coordina ofertas, asignaciones y failover.
+#[derive(Clone, Debug)]
+pub struct MissionManager {
+    max_attempts: usize,
+}
+
+impl Default for MissionManager {
+    fn default() -> Self {
+        Self { max_attempts: 3 }
+    }
+}
+
+impl MissionManager {
+    pub fn new(max_attempts: usize) -> Self {
+        Self {
+            max_attempts: max_attempts.max(1),
+        }
+    }
+
+    pub async fn assign_with_failover<F, Fut>(
+        &self,
+        offer: &MissionOffer,
+        providers: Vec<ProviderDescriptor>,
+        execute: F,
+    ) -> Result<String, MissionError>
+    where
+        F: FnMut(MissionAssignment) -> Fut,
+        Fut: std::future::Future<Output = Result<String, MissionError>>,
+    {
+        assign_with_failover_limited(offer, providers, self.max_attempts, execute).await
+    }
 }
 
 pub async fn assign_with_failover<F, Fut>(
     offer: &MissionOffer,
+    providers: Vec<ProviderDescriptor>,
+    execute: F,
+) -> Result<String, MissionError>
+where
+    F: FnMut(MissionAssignment) -> Fut,
+    Fut: std::future::Future<Output = Result<String, MissionError>>,
+{
+    assign_with_failover_limited(offer, providers, usize::MAX, execute).await
+}
+
+async fn assign_with_failover_limited<F, Fut>(
+    offer: &MissionOffer,
     mut providers: Vec<ProviderDescriptor>,
+    max_attempts: usize,
     mut execute: F,
 ) -> Result<String, MissionError>
 where
@@ -48,7 +96,7 @@ where
             .then_with(|| a.latency_ms.cmp(&b.latency_ms))
     });
     let mut last_error = MissionError::Exhausted;
-    for (index, provider) in providers.into_iter().enumerate() {
+    for (index, provider) in providers.into_iter().take(max_attempts).enumerate() {
         let assignment = MissionAssignment {
             mission_id: offer.mission_id.clone(),
             provider,

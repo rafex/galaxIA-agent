@@ -104,7 +104,7 @@ pub fn chat_request(plan: &RequestPlan, model: &str) -> fhs::ChatRequestMessage 
         model: model.into(),
         artifacts: vec![],
         document_context: context,
-        document_id: String::new(),
+        document_id: plan.document_id.clone().unwrap_or_default(),
     }
 }
 

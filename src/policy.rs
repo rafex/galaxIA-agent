@@ -61,6 +61,33 @@ impl Default for ModelPreferences {
     }
 }
 
+/// Controlador determinista de las políticas de una petición.
+///
+/// Este componente no usa el LLM: valida la petición y construye el plan que
+/// los demás agentes deben respetar.
+#[derive(Clone, Debug)]
+pub struct PolicyAgent {
+    max_tool_rounds: u8,
+}
+
+impl Default for PolicyAgent {
+    fn default() -> Self {
+        Self { max_tool_rounds: 3 }
+    }
+}
+
+impl PolicyAgent {
+    pub fn new(max_tool_rounds: u8) -> Self {
+        Self {
+            max_tool_rounds: max_tool_rounds.max(1),
+        }
+    }
+
+    pub fn build_plan(&self, request: AgentRequest) -> Result<RequestPlan, PolicyError> {
+        RequestPlan::from_request(request, self.max_tool_rounds)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentRequest {
     pub conversation_id: String,
@@ -76,7 +103,7 @@ pub struct AgentRequest {
     pub attachments: Vec<AttachmentRef>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DocumentChunk {
     pub chunk_id: String,
     pub filename: String,
@@ -88,7 +115,7 @@ pub struct DocumentChunk {
     pub source: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachmentRef {
     pub filename: String,
     pub size_bytes: usize,
@@ -101,6 +128,7 @@ pub struct RequestPlan {
     pub request_id: String,
     pub mission_id: String,
     pub message: String,
+    pub document_id: Option<String>,
     pub scope: PrivacyScope,
     pub rag_source: RagSource,
     pub context: Vec<DocumentChunk>,
@@ -125,6 +153,13 @@ pub enum PolicyError {
 
 impl RequestPlan {
     pub fn build(request: AgentRequest) -> Result<Self, PolicyError> {
+        Self::from_request(request, 3)
+    }
+
+    pub(crate) fn from_request(
+        request: AgentRequest,
+        max_tool_rounds: u8,
+    ) -> Result<Self, PolicyError> {
         if request.conversation_id.trim().is_empty() {
             return Err(PolicyError::MissingConversation);
         }
@@ -154,12 +189,13 @@ impl RequestPlan {
             request_id: request.request_id,
             mission_id: Uuid::new_v4().to_string(),
             message: request.message,
+            document_id: request.document_id,
             scope: request.preferences.scope,
             rag_source: request.preferences.rag_source,
             context: request.document_context,
             attachments: request.attachments,
             max_wait_ms: request.preferences.max_wait_ms,
-            max_tool_rounds: 3,
+            max_tool_rounds,
         })
     }
 

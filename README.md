@@ -6,6 +6,8 @@ Agente soberano de Navigator implementado en Rust sobre [Rig 0.42.0](https://doc
 
 Esta primera entrega contiene la base ejecutable y testeable del corte controlado:
 
+- supervisor multiagente con `PolicyAgent`, `DocumentAgent`, `RetrievalAgent`,
+  `MissionManager` y `ResponseAgent`;
 - `RequestPlan` determinista: scope, RAG, límite de contexto y tres rondas máximas.
 - Snapshot de providers compatible con discovery de Atlas.
 - `MissionOffer → bid/selección → assign → ejecución`, con timeout y failover.
@@ -15,6 +17,9 @@ Esta primera entrega contiene la base ejecutable y testeable del corte controlad
 - API HTTP/WebSocket mínima de transición en `8090`.
 
 La implementación productiva de libp2p FHS, la lectura real del snapshot Atlas y la traducción de todos los eventos al stream Portal son los siguientes cortes de integración; no se simulan como llamadas directas a `llama.cpp`.
+
+La responsabilidad de cada agente y sus límites de autoridad están descritos
+en [`docs/arquitectura-multiagente.md`](docs/arquitectura-multiagente.md).
 
 ## Política de seguridad y contexto
 

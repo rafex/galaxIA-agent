@@ -1,12 +1,19 @@
 pub mod agent;
 pub mod atlas;
+pub mod document;
 pub mod events;
 pub mod fhs;
 pub mod mission;
 pub mod policy;
 pub mod protocol;
+pub mod response;
+pub mod retrieval;
 pub mod star;
 pub mod tools;
 
-pub use agent::SovereignAgent;
-pub use policy::{AgentRequest, ModelPreferences, RequestPlan};
+pub use agent::{SovereignAgent, SupervisorAgent};
+pub use document::{DocumentAgent, DocumentError, DocumentWork};
+pub use mission::{MissionManager, MissionOffer};
+pub use policy::{AgentRequest, ModelPreferences, PolicyAgent, RequestPlan};
+pub use response::ResponseAgent;
+pub use retrieval::{RetrievalAgent, RetrievedContext};

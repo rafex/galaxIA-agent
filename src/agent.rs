@@ -1,20 +1,25 @@
 use crate::{
     atlas::AtlasClient,
+    document::DocumentAgent,
     events::{AgentEvent, EventBus},
     fhs::FhsTransport,
-    mission::{assign_with_failover, MissionError, MissionOffer},
-    policy::{AgentRequest, RequestPlan},
+    mission::{MissionManager, MissionOffer},
+    policy::{AgentRequest, PolicyAgent, RequestPlan},
     protocol::fhs,
-    star::StarCompletionModel,
+    response::ResponseAgent,
+    retrieval::RetrievalAgent,
 };
-use rig::{completion::Prompt, AgentBuilder};
 use serde_json::json;
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct SovereignAgent<T> {
     atlas: AtlasClient,
-    transport: Arc<T>,
+    policy: PolicyAgent,
+    documents: DocumentAgent,
+    retrieval: RetrievalAgent,
+    missions: MissionManager,
+    response: ResponseAgent<T>,
     events: EventBus,
 }
 
@@ -22,14 +27,42 @@ impl<T: FhsTransport + 'static> SovereignAgent<T> {
     pub fn new(atlas: AtlasClient, transport: Arc<T>, events: EventBus) -> Self {
         Self {
             atlas,
-            transport,
+            policy: PolicyAgent::default(),
+            documents: DocumentAgent::default(),
+            retrieval: RetrievalAgent,
+            missions: MissionManager::default(),
+            response: ResponseAgent::new(transport),
             events,
         }
     }
 
     pub async fn run(&self, request: AgentRequest) -> Result<String, String> {
-        let plan = RequestPlan::build(request).map_err(|e| e.to_string())?;
-        self.emit(&plan, "agent.status", json!({"status":"classifying"}), None);
+        let mut plan = self.policy.build_plan(request).map_err(|e| e.to_string())?;
+        self.emit(
+            &plan,
+            "agent.status",
+            json!({"status":"classifying", "agent":"policy"}),
+            None,
+        );
+        self.documents.inspect(&plan).map_err(|e| e.to_string())?;
+        self.emit(
+            &plan,
+            "agent.status",
+            json!({"status":"retrieving", "agent":"document"}),
+            None,
+        );
+        let retrieved = self.retrieval.apply(&mut plan);
+        self.emit(
+            &plan,
+            "agent.status",
+            json!({
+                "status":"context-ready",
+                "agent":"retrieval",
+                "ragSource": format!("{:?}", retrieved.source).to_lowercase(),
+                "chunks": retrieved.chunks.len()
+            }),
+            None,
+        );
         let providers = self.atlas.providers_for("chat", &plan.scope).await;
         let offer = MissionOffer {
             mission_id: plan.mission_id.clone(),
@@ -40,27 +73,18 @@ impl<T: FhsTransport + 'static> SovereignAgent<T> {
             bid_deadline_ms: plan.max_wait_ms,
         };
         let events = self.events.clone();
-        let transport = self.transport.clone();
+        let response = self.response.clone();
         let conversation_id = plan.conversation_id.clone();
         let request_id = plan.request_id.clone();
-        let result = assign_with_failover(&offer, providers, |assignment| {
-            let transport = transport.clone();
+        let result = self.missions.assign_with_failover(&offer, providers, |assignment| {
+            let response = response.clone();
             let plan = plan.clone();
             let events = events.clone();
             let conversation_id = conversation_id.clone();
             let request_id = request_id.clone();
             async move {
                 events.emit(AgentEvent { event: "llm.selected".into(), conversation_id, request_id, mission_id: Some(assignment.mission_id.clone()), provider_id: Some(assignment.provider.provider_id.clone()), data: json!({"model": assignment.provider.models.first().cloned().unwrap_or_else(|| "auto".into()), "attempt": assignment.attempt}) });
-                let model = assignment.provider.models.first().cloned().unwrap_or_else(|| "auto".into());
-                let model_adapter = StarCompletionModel::new(
-                    transport.clone(),
-                    assignment.clone(),
-                    model,
-                    plan.clone(),
-                );
-                let prompt = format!("Responde en español.\n{}\n\n{}", plan.message, plan.prompt_context());
-                let answer = AgentBuilder::new(model_adapter).preamble("La política de privacidad, el RAG, el provider y el límite de contexto ya fueron decididos por el controlador Rust.").default_max_turns(plan.max_tool_rounds as usize).build().prompt(prompt).await.map_err(|_| MissionError::Exhausted)?;
-                Ok(answer)
+                response.answer(&plan, assignment).await
             }
         }).await.map_err(|error| error.to_string())?;
         self.emit(
@@ -89,6 +113,9 @@ impl<T: FhsTransport + 'static> SovereignAgent<T> {
         });
     }
 }
+
+/// Nombre arquitectónico de la fachada Navigator durante la transición.
+pub type SupervisorAgent<T> = SovereignAgent<T>;
 
 pub fn portal_agent_start(session_id: String, scope: String) -> fhs::AgentStartMessage {
     fhs::AgentStartMessage {
