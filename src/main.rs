@@ -239,6 +239,40 @@ async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::er
                 t0.elapsed()
             );
         }
+        Some("rig") => {
+            use galaxia_agent::llm;
+            let text = args.get(1).cloned().unwrap_or_else(|| "Hola".into());
+            let model = llm::StarModel::new(node.clone(), "", None, llm::DEFAULT_LLM_TIMEOUT);
+            let request = llm::request(
+                &[
+                    Message {
+                        role: "system".into(),
+                        content: "Responde en español, breve.".into(),
+                        ..Default::default()
+                    },
+                    Message {
+                        role: "user".into(),
+                        content: text,
+                        ..Default::default()
+                    },
+                ],
+                &[],
+                0.7,
+            );
+            let t0 = std::time::Instant::now();
+            let response = model
+                .complete_streaming(request, |delta| {
+                    print!("{delta}");
+                    let _ = std::io::stdout().flush();
+                })
+                .await?;
+            println!(
+                "\n— vía Rig · Star {:?} · {} caracteres · {:?}",
+                model.executed_by(),
+                llm::text_of(&response).len(),
+                t0.elapsed()
+            );
+        }
         Some("tool") => {
             let capability = args
                 .get(1)
