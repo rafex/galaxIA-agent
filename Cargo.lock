@@ -1121,8 +1121,9 @@ dependencies = [
 [[package]]
 name = "galaxia-fhs"
 version = "0.1.0"
-source = "git+https://github.com/rafex/galaxIA-SDK?branch=main#b1a0a6cd367b4644ffae6fbb9f62b3a6d2e6ea70"
+source = "git+https://github.com/rafex/galaxIA-SDK?branch=main#f5662951cfc3bd9ba7bf2486c2e134ac0f2cc499"
 dependencies = [
+ "base64 0.22.1",
  "bs58",
  "ed25519-dalek 2.2.0",
  "futures",
@@ -2166,7 +2167,7 @@ dependencies = [
 [[package]]
 name = "libp2p-websocket"
 version = "0.46.0"
-source = "git+https://github.com/rafex/galaxIA-SDK?branch=main#b1a0a6cd367b4644ffae6fbb9f62b3a6d2e6ea70"
+source = "git+https://github.com/rafex/galaxIA-SDK?branch=main#f5662951cfc3bd9ba7bf2486c2e134ac0f2cc499"
 dependencies = [
  "either",
  "futures",
