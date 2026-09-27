@@ -99,6 +99,30 @@ Pendiente, sin bloquear la fase 5: cada misión espera los 2 s del plazo de
 pujas (una pregunta con KB tarda 14–30 s) y los artefactos solo viajan en
 línea (sin IPFS).
 
+## Prueba con el cliente del Portal (2026-09-27)
+
+`galaxIA-Core/apps/portal-chat/tests/e2e` corre el código de sesión del
+navegador (js-libp2p, handshake, verificación de firmas re-codificando con
+protobuf-es) contra una multiaddr. Contra el agente en sombra en Bastion
+(`25b4e35`, por túnel SSH) pasan las tres, sin ninguna firma rechazada:
+
+| Caso | Rust | TS en producción |
+|---|---|---|
+| Streaming con la KB recomendada | ✅ 13.7 s | ✅ |
+| Adjunto (OCR) con RAG de red | ✅ 15.7 s | ❌ sin RAG en la procedencia (E2E-031, corregido sin desplegar) |
+| Adjunto (OCR) con RAG local | ✅ 12.1 s | ✅ |
+
+Lo que encontró y ya está corregido: a los 23 s del arranque el agente
+todavía no conocía a Star ni al RAG y fallaba; ahora, durante los primeros
+35 s, una búsqueda vacía espera el anuncio (`PeerCache::settle`). Con las
+pruebas lanzadas 2 s después del arranque pasan igual.
+
+El beacon del DHT no se prueba por defecto: el Rust lo guarda en Atlas, pero
+el cliente js-libp2p del Portal nunca completa la consulta (E2E-032, afecta
+también al TS). El Portal sigue con las direcciones del anuncio y pierde 3 s.
+El Portal no envía `chatCancel`, así que la cancelación no forma parte del
+flujo real.
+
 ## Fase 5: cambio en Bastion
 
 1. Construir la imagen en Bastion y etiquetar la del TS para volver
