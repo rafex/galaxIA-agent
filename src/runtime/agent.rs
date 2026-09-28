@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::ipfs::{self, IpfsService, ReleaseGuard};
 use crate::llm::{self, StarModel};
 use crate::p2p::{client, dynamic, node::NodeHandle};
 use crate::protocol::fhs::{
@@ -43,6 +44,16 @@ pub enum RagSource {
     Network,
 }
 
+/// Adjuntos por IPFS pedidos en `agentStart` (DEC-0095).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IpfsPreference {
+    pub enabled: bool,
+    /// `public` o `private`.
+    pub network: String,
+    /// `retention: reuse`: el CID queda fijado hasta que el operador lo libere.
+    pub reuse: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Preferences {
     /// Modelo pedido; vacío o `auto` = el que ofrezca el Star.
@@ -55,6 +66,7 @@ pub struct Preferences {
     pub max_wait: Duration,
     /// DIDs vetados (`FHS_VETOED_PROVIDERS`).
     pub vetoed: Arc<HashSet<String>>,
+    pub ipfs: IpfsPreference,
 }
 
 impl Default for Preferences {
@@ -67,6 +79,7 @@ impl Default for Preferences {
             rag_source: RagSource::Local,
             max_wait: llm::DEFAULT_LLM_TIMEOUT,
             vetoed: Arc::default(),
+            ipfs: IpfsPreference::default(),
         }
     }
 }
@@ -111,6 +124,19 @@ pub struct AgentRuntime<'a> {
     conversation_id: String,
     used_tools: Vec<UsedTool>,
     last_ocr_error: Option<String>,
+    ipfs: Option<IpfsTurn>,
+}
+
+/// Contexto IPFS de un turno de la sesión del Portal.
+pub struct IpfsTurn {
+    /// `None`: este Navigator no tiene IPFS (el turno falla cerrado si el
+    /// usuario lo pidió).
+    pub service: Option<IpfsService>,
+    /// Sesión del Portal (cuota de una subida en curso por sesión).
+    pub session: String,
+    pub turn_id: String,
+    /// Fija la gracia de los leases del turno al soltarse el runtime.
+    pub guard: Option<ReleaseGuard>,
 }
 
 struct ResolvedLlm {
@@ -131,7 +157,14 @@ impl<'a> AgentRuntime<'a> {
             conversation_id: conversation_id.into(),
             used_tools: Vec::new(),
             last_ocr_error: None,
+            ipfs: None,
         }
+    }
+
+    /// Turno de una sesión del Portal: habilita subir adjuntos por IPFS.
+    pub fn with_ipfs(mut self, ipfs: IpfsTurn) -> Self {
+        self.ipfs = Some(ipfs);
+        self
     }
 
     pub fn conversation_id(&self) -> &str {
@@ -207,7 +240,7 @@ impl<'a> AgentRuntime<'a> {
             tools.retain(|t| t.capability != "document.ocr");
             if !ocr.is_empty() {
                 let text = self
-                    .run_ocr(&ocr, &turn.artifacts[0], preferences, true)
+                    .run_ocr(&ocr, &turn.artifacts[0], preferences, true, &[])
                     .await;
                 // El OCR nunca entra completo al prompt: queda para RAG.
                 user_content = match text {
@@ -419,6 +452,7 @@ impl<'a> AgentRuntime<'a> {
         arguments: DynamicValue,
         preferences: &Preferences,
         silent: bool,
+        extra_capabilities: &[String],
     ) -> Result<Value, String> {
         let started = Instant::now();
         if !silent {
@@ -431,6 +465,7 @@ impl<'a> AgentRuntime<'a> {
             &self.node,
             client::ToolRequest {
                 capability: tool.capability.clone(),
+                extra_capabilities: extra_capabilities.to_vec(),
                 tool_name: tool.name.clone(),
                 arguments,
                 preferred_provider: Some(tool.provider_id.clone()),
@@ -508,7 +543,10 @@ impl<'a> AgentRuntime<'a> {
                 insert_field(&mut arguments, "file", artifact_value(artifact));
             }
         }
-        match self.call_tool(&tool, arguments, preferences, false).await {
+        match self
+            .call_tool(&tool, arguments, preferences, false, &[])
+            .await
+        {
             Ok(result) => extract_text(&result),
             Err(error) => json!({"error": error}).to_string(),
         }
@@ -521,6 +559,7 @@ impl<'a> AgentRuntime<'a> {
         artifact: &ArtifactRef,
         preferences: &Preferences,
         announce: bool,
+        extra_capabilities: &[String],
     ) -> Option<String> {
         self.last_ocr_error = None;
         for (i, tool) in tools.iter().enumerate() {
@@ -535,7 +574,7 @@ impl<'a> AgentRuntime<'a> {
             };
             insert_field(&mut arguments, "file", artifact_value(artifact));
             match self
-                .call_tool(tool, arguments, preferences, !announce)
+                .call_tool(tool, arguments, preferences, !announce, extra_capabilities)
                 .await
             {
                 Ok(result) => {
@@ -562,6 +601,83 @@ impl<'a> AgentRuntime<'a> {
         None
     }
 
+    /// Sube el adjunto inline al Kubo local y devuelve su `ArtifactRef` IPFS y
+    /// la capacidad que debe tener el OCR (`ipfs.native.<red>`). Falla
+    /// cerrado: si el usuario pidió IPFS y no se puede, no cae a inline.
+    async fn upload_to_ipfs(
+        &mut self,
+        artifact: &ArtifactRef,
+        preferences: &Preferences,
+    ) -> Result<(ArtifactRef, String), RuntimeError> {
+        let network = if preferences.ipfs.network.is_empty() {
+            "public"
+        } else {
+            preferences.ipfs.network.as_str()
+        };
+        let Some(ipfs) = self.ipfs.as_ref() else {
+            return Err(RuntimeError::new(
+                "UNSUPPORTED_CAPABILITY",
+                "IPFS no disponible en este Navigator",
+            ));
+        };
+        let Some(service) = ipfs.service.clone() else {
+            return Err(RuntimeError::new(
+                "UNSUPPORTED_CAPABILITY",
+                "IPFS no disponible en este Navigator",
+            ));
+        };
+        if service.network() != network {
+            return Err(RuntimeError::new(
+                "UNSUPPORTED_CAPABILITY",
+                format!("Red IPFS {network} no configurada en este Navigator"),
+            ));
+        }
+        let Some(artifact_ref::Transport::Inline(inline)) = &artifact.transport else {
+            return Err(RuntimeError::new(
+                "INVALID_ARGUMENTS",
+                "El adjunto debe llegar inline; el Navigator lo sube a IPFS",
+            ));
+        };
+        let capability = format!("ipfs.native.{network}");
+        // Sin un OCR con IPFS no se sube nada.
+        if providers::tools_with(
+            &self.node.peers,
+            "document.ocr",
+            &[capability.as_str()],
+            preferences.scope,
+        )
+        .is_empty()
+        {
+            return Err(RuntimeError::new(
+                "NO_OCR_PROVIDER",
+                "Ningún OCR con acceso a IPFS",
+            ));
+        }
+        let cid = service
+            .upload(
+                &ipfs.session,
+                &ipfs.turn_id,
+                inline.data.clone(),
+                preferences.ipfs.reuse,
+            )
+            .await
+            .map_err(|e| RuntimeError::new(e.code, e.message))?;
+        let reference = ArtifactRef {
+            transport: Some(artifact_ref::Transport::Ipfs(fhs::IpfsArtifact {
+                cid,
+                network: network.into(),
+                gateway_url: ipfs::gateway_hint(network).into(),
+                filename: inline.filename.clone(),
+                retention: if preferences.ipfs.reuse {
+                    "reuse".into()
+                } else {
+                    "ephemeral".into()
+                },
+            })),
+        };
+        Ok((reference, capability))
+    }
+
     /// OCR para la sesión (adjunto recién subido); emite `ocr.extracted`.
     pub async fn extract_ocr_text(
         &mut self,
@@ -569,15 +685,37 @@ impl<'a> AgentRuntime<'a> {
         preferences: &Preferences,
     ) -> Result<(String, String), RuntimeError> {
         self.settle_tools("document.ocr", preferences).await;
-        let tools = providers::tools_for(&self.node.peers, &["document.ocr"], preferences.scope);
+        let (artifact, extra) = if preferences.ipfs.enabled {
+            let (artifact, capability) = self.upload_to_ipfs(artifact, preferences).await?;
+            (artifact, vec![capability])
+        } else {
+            (artifact.clone(), vec![])
+        };
+        let artifact = &artifact;
+        let extra_refs: Vec<&str> = extra.iter().map(String::as_str).collect();
+        let tools = providers::tools_with(
+            &self.node.peers,
+            "document.ocr",
+            &extra_refs,
+            preferences.scope,
+        );
         if tools.is_empty() {
             return Err(RuntimeError::new(
                 "NO_OCR_PROVIDER",
                 "No hay un Satellite de OCR disponible",
             ));
         }
-        match self.run_ocr(&tools, artifact, preferences, true).await {
-            Some(text) => Ok((artifact_filename(artifact), text)),
+        match self
+            .run_ocr(&tools, artifact, preferences, true, &extra)
+            .await
+        {
+            Some(text) => {
+                // El OCR ya terminó de leer: el CID solo necesita la gracia corta.
+                if let Some(guard) = self.ipfs.as_mut().and_then(|i| i.guard.as_mut()) {
+                    guard.succeeded();
+                }
+                Ok((artifact_filename(artifact), text))
+            }
             None => Err(RuntimeError::new(
                 "OCR_FAILED",
                 format!(
@@ -608,7 +746,7 @@ impl<'a> AgentRuntime<'a> {
         let Ok(arguments) = dynamic::from_json(&args) else {
             return false;
         };
-        self.call_tool(&tool, arguments, preferences, true)
+        self.call_tool(&tool, arguments, preferences, true, &[])
             .await
             .is_ok()
     }
@@ -628,7 +766,13 @@ impl<'a> AgentRuntime<'a> {
             .next()?;
         let args = json!({"query": query, "conversationId": self.conversation_id, "documentId": document_id.unwrap_or_default(), "top_k": top_k});
         let result = self
-            .call_tool(&tool, dynamic::from_json(&args).ok()?, preferences, true)
+            .call_tool(
+                &tool,
+                dynamic::from_json(&args).ok()?,
+                preferences,
+                true,
+                &[],
+            )
             .await
             .ok()?;
         let chunks = kb::chunks_from(&result);
@@ -684,7 +828,13 @@ impl<'a> AgentRuntime<'a> {
             labels.push((kb_id.clone(), tool.provider_name.clone()));
             let args = json!({"query": query, "topK": 3, "top_k": 3});
             let Ok(result) = self
-                .call_tool(&tool, dynamic::from_json(&args).ok()?, preferences, true)
+                .call_tool(
+                    &tool,
+                    dynamic::from_json(&args).ok()?,
+                    preferences,
+                    true,
+                    &[],
+                )
                 .await
             else {
                 continue;

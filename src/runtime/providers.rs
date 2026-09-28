@@ -64,6 +64,13 @@ fn guess_capability(tool: &str) -> String {
 /// Tools anunciadas en el beacon (`tool:<nombre>`), asociadas a una
 /// capability anunciada; sin tags, cada capability es su propia tool.
 pub fn advertised_tools(peer: &PeerEntry) -> Vec<LoadedTool> {
+    // `ipfs.native.<red>` describe acceso a IPFS, no es una tool.
+    let capabilities: Vec<String> = peer
+        .capabilities
+        .iter()
+        .filter(|c| !c.starts_with("ipfs.native."))
+        .cloned()
+        .collect();
     let names: Vec<String> = peer
         .tags()
         .iter()
@@ -71,19 +78,19 @@ pub fn advertised_tools(peer: &PeerEntry) -> Vec<LoadedTool> {
         .filter(|n| !n.is_empty())
         .collect();
     let candidates = if names.is_empty() {
-        peer.capabilities.clone()
+        capabilities.clone()
     } else {
         names
     };
     candidates
         .into_iter()
         .filter_map(|name| {
-            let capability = if peer.capabilities.len() == 1 {
-                peer.capabilities[0].clone()
+            let capability = if capabilities.len() == 1 {
+                capabilities[0].clone()
             } else {
                 guess_capability(&name)
             };
-            peer.capabilities.contains(&capability).then(|| LoadedTool {
+            capabilities.contains(&capability).then(|| LoadedTool {
                 description: format!("Capability '{capability}' vía satellite P2P"),
                 name,
                 capability,
@@ -106,6 +113,24 @@ pub fn tools_for(
         .filter(|p| allowed(p, scope))
         .flat_map(advertised_tools)
         .filter(|t| capabilities.contains(&t.capability.as_str()))
+        .collect()
+}
+
+/// Tools de `capability` de los Satellites en ámbito que además anuncian
+/// todas las capacidades `also` (p. ej. `ipfs.native.public`).
+pub fn tools_with(
+    peers: &PeerCache,
+    capability: &str,
+    also: &[&str],
+    scope: Option<Scope>,
+) -> Vec<LoadedTool> {
+    peers
+        .satellites()
+        .iter()
+        .filter(|p| allowed(p, scope))
+        .filter(|p| also.iter().all(|c| p.capabilities.iter().any(|pc| pc == c)))
+        .flat_map(advertised_tools)
+        .filter(|t| t.capability == capability)
         .collect()
 }
 
@@ -194,6 +219,33 @@ mod tests {
             "kb_query"
         );
         assert_eq!(kb_providers(&kb, Some(Scope::Community)).len(), 1);
+    }
+
+    #[test]
+    fn ipfs_access_filters_ocr_providers_and_is_not_a_tool() {
+        let with = satellite(
+            "did:con",
+            &["document.ocr", "ipfs.native.public"],
+            &["tool:extract_text"],
+            Visibility::Community,
+        );
+        let tools = tools_with(&with, "document.ocr", &["ipfs.native.public"], None);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "extract_text");
+        assert!(tools_with(&with, "document.ocr", &["ipfs.native.private"], None).is_empty());
+        let without = satellite("did:sin", &["document.ocr"], &[], Visibility::Community);
+        assert!(tools_with(&without, "document.ocr", &["ipfs.native.public"], None).is_empty());
+        assert_eq!(tools_with(&without, "document.ocr", &[], None).len(), 1);
+        // Sin tags, la capacidad de IPFS no se vuelve una tool.
+        let untagged = satellite(
+            "did:x",
+            &["document.ocr", "ipfs.native.public"],
+            &[],
+            Visibility::Community,
+        );
+        let tools = tools_with(&untagged, "document.ocr", &[], None);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].capability, "document.ocr");
     }
 
     #[test]

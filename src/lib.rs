@@ -1,4 +1,6 @@
+pub mod admin;
 pub mod config;
+pub mod ipfs;
 pub mod llm;
 pub mod runtime;
 pub mod session;

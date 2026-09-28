@@ -16,19 +16,35 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::ipfs::IpfsService;
 use crate::p2p::{framing, node::NodeHandle, peer_cache::now_ms, wire};
 use crate::protocol::fhs::{
     self, envelope::Payload, AgentStartMessage, ArtifactRef, ChatRequestMessage, DocumentContext,
     FhsErrorCode, HandshakeAckMessage,
 };
-use crate::runtime::agent::{AgentRuntime, Preferences, RagSource, Turn};
+use crate::runtime::agent::{AgentRuntime, IpfsPreference, IpfsTurn, Preferences, RagSource, Turn};
 use crate::runtime::events::{AgentEvent, EventSink, KbCandidate};
 use crate::runtime::providers::Scope;
 
-/// Valores por defecto de cada sesión (vetos, espera máxima).
-#[derive(Clone, Default)]
+/// Valores por defecto de cada sesión (vetos, espera máxima) y recursos
+/// compartidos.
+#[derive(Clone)]
 pub struct SessionDefaults {
     pub preferences: Preferences,
+    /// IPFS de este Navigator (`None` sin `IPFS_API_URL`).
+    pub ipfs: Option<IpfsService>,
+    /// Tope de un adjunto (`ATTACHMENT_MAX_BYTES`).
+    pub attachment_max_bytes: usize,
+}
+
+impl Default for SessionDefaults {
+    fn default() -> Self {
+        Self {
+            preferences: Preferences::default(),
+            ipfs: None,
+            attachment_max_bytes: crate::config::DEFAULT_ATTACHMENT_MAX_BYTES,
+        }
+    }
 }
 
 /// Traduce los eventos del runtime a Envelopes hacia el Portal.
@@ -119,10 +135,13 @@ impl EventSink for SessionSink {
 }
 
 fn error_payload(mission_id: &str, code: &str, message: &str) -> Payload {
-    let code = if code == "CANCELLED" {
-        FhsErrorCode::Cancelled
-    } else {
-        FhsErrorCode::InternalError
+    let code = match code {
+        "CANCELLED" => FhsErrorCode::Cancelled,
+        "INVALID_ARGUMENTS" => FhsErrorCode::InvalidArguments,
+        "OVERLOADED" => FhsErrorCode::Overloaded,
+        "UNSUPPORTED_CAPABILITY" => FhsErrorCode::UnsupportedCapability,
+        "UPSTREAM_UNAVAILABLE" => FhsErrorCode::UpstreamUnavailable,
+        _ => FhsErrorCode::InternalError,
     };
     Payload::Error(fhs::ErrorMessage {
         code: code as i32,
@@ -136,13 +155,16 @@ struct Pending {
     candidates: Vec<KbCandidate>,
 }
 
-#[derive(Default)]
 struct SessionState {
+    /// Clave de la sesión (stream) para las cuotas de IPFS.
+    key: String,
     session_id: Option<String>,
     preferences: Preferences,
     rag_active: HashSet<String>,
     pending: HashMap<String, Pending>,
     active: HashMap<String, JoinHandle<()>>,
+    ipfs: Option<IpfsService>,
+    attachment_max_bytes: usize,
 }
 
 /// Acepta sesiones del Portal mientras el nodo exista.
@@ -155,7 +177,15 @@ pub async fn serve(node: NodeHandle, defaults: SessionDefaults) {
         }
     };
     while let Some((peer, stream)) = incoming.next().await {
-        tokio::spawn(run_session(node.clone(), peer, stream, defaults.clone()));
+        let Some(permit) = node.admit_stream(peer) else {
+            drop(stream);
+            continue;
+        };
+        let (node, defaults) = (node.clone(), defaults.clone());
+        tokio::spawn(async move {
+            let _permit = permit;
+            run_session(node, peer, stream, defaults).await;
+        });
     }
 }
 
@@ -206,8 +236,14 @@ async fn run_session(
     }));
 
     let state = Arc::new(Mutex::new(SessionState {
+        key: Uuid::new_v4().to_string(),
+        session_id: None,
         preferences: defaults.preferences.clone(),
-        ..Default::default()
+        rag_active: HashSet::new(),
+        pending: HashMap::new(),
+        active: HashMap::new(),
+        ipfs: defaults.ipfs.clone(),
+        attachment_max_bytes: defaults.attachment_max_bytes,
     }));
     loop {
         let envelope = match framing::read_verified(&mut reader).await {
@@ -307,6 +343,33 @@ fn preferences_from_start(start: &AgentStartMessage, defaults: &Preferences) -> 
         },
         max_wait: defaults.max_wait,
         vetoed: defaults.vetoed.clone(),
+        ipfs: IpfsPreference {
+            enabled: start.ipfs_enabled,
+            network: start.ipfs_network.clone(),
+            reuse: start.ipfs_retention == "reuse",
+        },
+    }
+}
+
+/// Un adjunto por mensaje, inline y dentro del tope; el backend lo valida
+/// aunque el Portal ya lo haga.
+fn validate_artifacts(artifacts: &[ArtifactRef], max_bytes: usize) -> Result<(), String> {
+    if artifacts.len() > 1 {
+        return Err("Solo se admite un adjunto por mensaje".into());
+    }
+    match artifacts.first().and_then(|a| a.transport.as_ref()) {
+        None if artifacts.is_empty() => Ok(()),
+        Some(fhs::artifact_ref::Transport::Inline(inline)) => {
+            if inline.data.len() > max_bytes {
+                Err(format!(
+                    "El adjunto supera el máximo de {} MB",
+                    max_bytes / (1024 * 1024)
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err("El adjunto debe enviarse inline".into()),
     }
 }
 
@@ -347,6 +410,11 @@ fn handle_chat(
         ));
         return;
     };
+    let max_bytes = state.lock().expect("session").attachment_max_bytes;
+    if let Err(message) = validate_artifacts(&request.artifacts, max_bytes) {
+        let _ = tx.send(error_payload(&conversation, "INVALID_ARGUMENTS", &message));
+        return;
+    }
     if !request.model.is_empty() {
         preferences.model = request.model.clone();
     }
@@ -395,12 +463,23 @@ fn spawn_turn(
     let tx = tx.clone();
     let task_state = state.clone();
     let id = conversation.clone();
+    let turn_id = Uuid::new_v4().to_string();
+    let (service, session_key) = {
+        let s = state.lock().expect("session");
+        (s.ipfs.clone(), s.key.clone())
+    };
+    let ipfs_turn = IpfsTurn {
+        guard: service.as_ref().map(|svc| svc.release_guard(&turn_id)),
+        service: service.clone(),
+        session: session_key,
+        turn_id: turn_id.clone(),
+    };
     let handle = tokio::spawn(async move {
         let sink = SessionSink {
             tx: tx.clone(),
             conversation: id.clone(),
         };
-        let mut runtime = AgentRuntime::new(node, &sink, id.clone());
+        let mut runtime = AgentRuntime::new(node, &sink, id.clone()).with_ipfs(ipfs_turn);
         let turn = match work {
             TurnWork::Attachment(turn) => {
                 match attachment(&mut runtime, &sink, &task_state, turn, &preferences).await {
@@ -449,6 +528,11 @@ fn spawn_turn(
         }
         task_state.lock().expect("session").active.remove(&id);
     });
+    // Registro síncrono: el barrido de IPFS sabe si el turno sigue vivo
+    // aunque se pierda el aviso de fin de turno.
+    if let Some(service) = &service {
+        service.turns().register(&turn_id, handle.abort_handle());
+    }
     state
         .lock()
         .expect("session")
@@ -571,15 +655,45 @@ mod tests {
     }
 
     #[test]
+    fn one_inline_attachment_within_the_limit() {
+        let inline = |n: usize| ArtifactRef {
+            transport: Some(fhs::artifact_ref::Transport::Inline(fhs::InlineArtifact {
+                data: vec![0; n],
+                filename: "a.pdf".into(),
+            })),
+        };
+        assert!(validate_artifacts(&[], 10).is_ok());
+        assert!(validate_artifacts(&[inline(10)], 10).is_ok());
+        assert!(validate_artifacts(&[inline(11)], 10).is_err());
+        assert_eq!(
+            validate_artifacts(&[inline(1), inline(1)], 10).unwrap_err(),
+            "Solo se admite un adjunto por mensaje"
+        );
+        let ipfs = ArtifactRef {
+            transport: Some(fhs::artifact_ref::Transport::Ipfs(Default::default())),
+        };
+        assert!(validate_artifacts(&[ipfs], 10).is_err());
+        assert!(matches!(
+            error_payload("c", "INVALID_ARGUMENTS", "x"),
+            Payload::Error(e) if e.code == FhsErrorCode::InvalidArguments as i32
+        ));
+    }
+
+    #[test]
     fn preferences_follow_agent_start() {
         let start = AgentStartMessage {
             scope: "local".into(),
             kb: "did:kb".into(),
             kb_max_per_question: 0,
             rag_source: fhs::RagSource::Network as i32,
+            ipfs_enabled: true,
+            ipfs_network: "public".into(),
+            ipfs_retention: "reuse".into(),
             ..Default::default()
         };
         let p = preferences_from_start(&start, &Preferences::default());
+        assert!(p.ipfs.enabled && p.ipfs.reuse);
+        assert_eq!(p.ipfs.network, "public");
         assert_eq!(p.scope, Some(Scope::Local));
         assert_eq!(p.kb, "did:kb");
         assert_eq!(p.kb_max_per_question, 1);

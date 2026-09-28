@@ -3,6 +3,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 use galaxia_agent::{
     config::AgentConfig,
+    ipfs::IpfsService,
     p2p::{self, identity::NodeIdentity, node::NodeHandle},
 };
 use serde_json::{json, Value};
@@ -12,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 struct AppState {
     node: NodeHandle,
     config: Arc<AgentConfig>,
+    ipfs: Option<IpfsService>,
 }
 
 #[tokio::main]
@@ -62,6 +64,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|d| d.trim().split('#').next().unwrap_or_default().to_string())
         .filter(|d| !d.is_empty())
         .collect();
+    let ipfs = match &config.ipfs {
+        Some(ipfs_config) => {
+            let service = IpfsService::start(ipfs_config)?;
+            tracing::info!(
+                "IPFS nativo en red {} vía Kubo local (libro {})",
+                ipfs_config.network,
+                ipfs_config.ledger_path.display()
+            );
+            Some(service)
+        }
+        None => {
+            tracing::info!("sin IPFS_API_URL: los adjuntos viajan inline");
+            None
+        }
+    };
+    let admin_token = galaxia_agent::admin::load_or_create_token(&config.admin_token_path)?;
+    tokio::spawn(galaxia_agent::admin::serve(
+        config.admin_addr,
+        admin_token,
+        ipfs.clone(),
+    ));
     tokio::spawn(galaxia_agent::session::serve(
         node.clone(),
         galaxia_agent::session::SessionDefaults {
@@ -69,6 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 vetoed: Arc::new(vetoed),
                 ..Default::default()
             },
+            ipfs: ipfs.clone(),
+            attachment_max_bytes: config.attachment_max_bytes,
         },
     ));
 
@@ -80,6 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         node,
         config: config.clone(),
+        ipfs,
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -144,6 +170,10 @@ async fn status(State(state): State<AppState>) -> impl IntoResponse {
         map.insert(
             "knownPeers".into(),
             serde_json::to_value(state.node.peers.known_peers()).unwrap_or_default(),
+        );
+        map.insert(
+            "ipfs".into(),
+            state.ipfs.as_ref().map_or(Value::Null, IpfsService::status),
         );
     }
     Json(body)
@@ -412,6 +442,7 @@ async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::er
                 node,
                 client::ToolRequest {
                     capability,
+                    extra_capabilities: vec![],
                     tool_name: tool,
                     arguments: dynamic::from_json(&json)?,
                     preferred_provider: None,
