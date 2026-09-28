@@ -270,10 +270,15 @@ impl IpfsService {
         }
     }
 
+    /// Aplica `f` y guarda el libro solo si cambió (el barrido corre cada
+    /// minuto; no se reescribe ni se rotan respaldos sin cambios).
     fn mutate<T>(&self, f: impl FnOnce(&mut State) -> T) -> T {
         let mut state = self.inner.state.lock().expect("ipfs");
+        let before = state.ledger.clone();
         let out = f(&mut state);
-        self.persist(&state);
+        if state.ledger != before {
+            self.persist(&state);
+        }
         out
     }
 
