@@ -34,7 +34,8 @@ Responde siempre en español. \
 Si recibes fragmentos de una base de conocimiento o de documentos, responde con base en los que se \
 relacionan con la pregunta e ignora los que no tengan relación; si ninguno la responde, dilo. \
 Si necesitas usar una herramienta, hazlo UNA SOLA VEZ y luego responde con la información obtenida. \
-No repitas llamadas a herramientas.";
+No repitas llamadas a herramientas. \
+Sé conciso: responde en un máximo de 5 oraciones salvo que el usuario pida más detalle.";
 
 const QUESTION_MARKER: &str = "\n\n[Pregunta del usuario]\n";
 const TEMPERATURE: f64 = 0.7;
