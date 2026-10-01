@@ -64,6 +64,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|d| d.trim().split('#').next().unwrap_or_default().to_string())
         .filter(|d| !d.is_empty())
         .collect();
+    // DIDs de los nodos de cálculo permitidos: un DID inválido impide arrancar.
+    let calc_nodes: Vec<String> = std::env::var("FHS_CALC_NODES")
+        .unwrap_or_default()
+        .split(',')
+        .map(|d| d.trim().split('#').next().unwrap_or_default().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
+    for did in &calc_nodes {
+        p2p::identity::peer_id_of_did(did).map_err(|e| format!("FHS_CALC_NODES: {did}: {e}"))?;
+    }
+    if !calc_nodes.is_empty() {
+        tracing::info!("nodos de cálculo permitidos: {}", calc_nodes.len());
+    }
     let ipfs = match &config.ipfs {
         Some(ipfs_config) => {
             let service = IpfsService::start(ipfs_config)?;
@@ -90,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         galaxia_agent::session::SessionDefaults {
             preferences: galaxia_agent::runtime::agent::Preferences {
                 vetoed: Arc::new(vetoed),
+                calc_nodes: Arc::new(calc_nodes),
                 ..Default::default()
             },
             ipfs: ipfs.clone(),
@@ -447,6 +461,8 @@ async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::er
                     arguments: dynamic::from_json(&json)?,
                     preferred_provider: None,
                     timeout: Duration::from_secs(120),
+                    mission_id: None,
+                    allowed_provider_dids: None,
                 },
             )
             .await?;

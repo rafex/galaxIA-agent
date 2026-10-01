@@ -22,7 +22,10 @@ use crate::protocol::fhs::{
     self, envelope::Payload, AgentStartMessage, ArtifactRef, ChatRequestMessage, DocumentContext,
     FhsErrorCode, HandshakeAckMessage,
 };
-use crate::runtime::agent::{AgentRuntime, IpfsPreference, IpfsTurn, Preferences, RagSource, Turn};
+use crate::runtime::agent::{
+    AgentRuntime, CalcDecision, CalcPlan, IpfsPreference, IpfsTurn, Preferences, RagSource, Turn,
+};
+use crate::runtime::calc;
 use crate::runtime::events::{AgentEvent, EventSink, KbCandidate};
 use crate::runtime::providers::Scope;
 
@@ -153,7 +156,22 @@ struct Pending {
     turn: Turn,
     preferences: Preferences,
     candidates: Vec<KbCandidate>,
+    /// Autorización de un comando `/calc` (en vez de una recomendación de KB).
+    calc: Option<CalcPending>,
 }
+
+struct CalcPending {
+    plan: CalcPlan,
+    authorization_id: String,
+    expires_at: std::time::Instant,
+}
+
+/// Cuánto espera la autorización de un comando antes de darla por rechazada.
+const CALC_AUTHORIZATION_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Marca del `description` con la que el Portal pinta una autorización de
+/// comando en vez de una recomendación de KB (deuda: migrar a
+/// `tool.authorization.*` del IDL).
+pub const CALC_AUTHORIZATION_MARKER: &str = "[autorización /calc] ";
 
 struct SessionState {
     /// Clave de la sesión (stream) para las cuotas de IPFS.
@@ -265,12 +283,38 @@ async fn run_session(
             }
             Some(Payload::ChatRequest(request)) => handle_chat(&node, &state, &tx, request),
             Some(Payload::KbDecision(decision)) => {
+                let decision_id = decision.mission_id.clone();
                 let pending = state
                     .lock()
                     .expect("session")
                     .pending
                     .remove(&decision.mission_id);
                 if let Some(pending) = pending {
+                    if let Some(calc) = pending.calc {
+                        // Una sola vez y antes de vencer; si no, es rechazo.
+                        let decision =
+                            if decision.r#use && calc.expires_at > std::time::Instant::now() {
+                                CalcDecision::Authorized {
+                                    authorization_id: calc.authorization_id,
+                                }
+                            } else if decision.r#use {
+                                CalcDecision::Expired
+                            } else {
+                                CalcDecision::Declined
+                            };
+                        spawn_turn(
+                            &node,
+                            &state,
+                            &tx,
+                            decision_id.clone(),
+                            TurnWork::CalcRun {
+                                plan: calc.plan,
+                                decision,
+                            },
+                            pending.preferences,
+                        );
+                        continue;
+                    }
                     let mut turn = pending.turn;
                     turn.kb_provider_ids = if decision.r#use {
                         pending
@@ -343,6 +387,7 @@ fn preferences_from_start(start: &AgentStartMessage, defaults: &Preferences) -> 
         },
         max_wait: defaults.max_wait,
         vetoed: defaults.vetoed.clone(),
+        calc_nodes: defaults.calc_nodes.clone(),
         ipfs: IpfsPreference {
             enabled: start.ipfs_enabled,
             network: start.ipfs_network.clone(),
@@ -380,6 +425,13 @@ enum TurnWork {
     ResolveKb(Turn),
     /// Responder con las KBs ya decididas.
     Run(Turn),
+    /// `/calc`: validar, elegir el nodo y pedir autorización.
+    Calc(Turn),
+    /// `/calc` ya decidido por el usuario (o por el tiempo).
+    CalcRun {
+        plan: CalcPlan,
+        decision: CalcDecision,
+    },
 }
 
 fn handle_chat(
@@ -443,7 +495,9 @@ fn handle_chat(
         kb_provider_ids: vec![],
         rag_active,
     };
-    let work = if turn.artifacts.is_empty() {
+    let work = if turn.artifacts.is_empty() && calc::parse_command(&turn.message).is_some() {
+        TurnWork::Calc(turn)
+    } else if turn.artifacts.is_empty() {
         TurnWork::ResolveKb(turn)
     } else {
         TurnWork::Attachment(turn)
@@ -480,6 +534,95 @@ fn spawn_turn(
             conversation: id.clone(),
         };
         let mut runtime = AgentRuntime::new(node, &sink, id.clone()).with_ipfs(ipfs_turn);
+        let work = match work {
+            TurnWork::Calc(turn) => {
+                match runtime.prepare_calc(&turn.message, &preferences).await {
+                    Ok(plan) => {
+                        let authorization_id = Uuid::new_v4().to_string();
+                        let candidate = KbCandidate {
+                            provider_id: plan.node_did.clone(),
+                            provider_name: plan.node_name.clone(),
+                            description: format!(
+                                "{CALC_AUTHORIZATION_MARKER}Se publicará una oferta y se enviará la expresión «{}» al nodo móvil {}",
+                                plan.expression, plan.node_name
+                            ),
+                        };
+                        task_state.lock().expect("session").pending.insert(
+                            id.clone(),
+                            Pending {
+                                turn,
+                                preferences: preferences.clone(),
+                                candidates: vec![],
+                                calc: Some(CalcPending {
+                                    plan,
+                                    authorization_id: authorization_id.clone(),
+                                    expires_at: std::time::Instant::now() + CALC_AUTHORIZATION_TTL,
+                                }),
+                            },
+                        );
+                        sink.emit(AgentEvent::KbRecommended {
+                            candidates: vec![candidate],
+                            chosen_by_llm: false,
+                        });
+                        // Vencimiento: quita el pendiente (si nadie lo consumió)
+                        // y responde sin enviar nada.
+                        let (node, state, tx) =
+                            (runtime.node().clone(), task_state.clone(), tx.clone());
+                        let conversation = id.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(CALC_AUTHORIZATION_TTL).await;
+                            let expired = {
+                                let mut s = state.lock().expect("session");
+                                let same = s.pending.get(&conversation).is_some_and(|p| {
+                                    p.calc
+                                        .as_ref()
+                                        .is_some_and(|c| c.authorization_id == authorization_id)
+                                });
+                                if same {
+                                    s.pending.remove(&conversation)
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(Pending {
+                                calc: Some(calc),
+                                preferences,
+                                ..
+                            }) = expired
+                            {
+                                spawn_turn(
+                                    &node,
+                                    &state,
+                                    &tx,
+                                    conversation,
+                                    TurnWork::CalcRun {
+                                        plan: calc.plan,
+                                        decision: CalcDecision::Expired,
+                                    },
+                                    preferences,
+                                );
+                            }
+                        });
+                    }
+                    Err(error) => sink.emit(AgentEvent::Error {
+                        code: error.code.into(),
+                        message: error.message,
+                    }),
+                }
+                return;
+            }
+            TurnWork::CalcRun { plan, decision } => {
+                if let Err(error) = runtime.run_calc(plan, decision, &preferences).await {
+                    sink.emit(AgentEvent::Error {
+                        code: error.code.into(),
+                        message: error.message,
+                    });
+                }
+                task_state.lock().expect("session").active.remove(&id);
+                return;
+            }
+            other => other,
+        };
         let turn = match work {
             TurnWork::Attachment(turn) => {
                 match attachment(&mut runtime, &sink, &task_state, turn, &preferences).await {
@@ -507,6 +650,7 @@ fn spawn_turn(
                                 turn,
                                 preferences: preferences.clone(),
                                 candidates: candidates.clone(),
+                                calc: None,
                             },
                         );
                         sink.emit(AgentEvent::KbRecommended {
@@ -518,7 +662,9 @@ fn spawn_turn(
                 }
             }
             TurnWork::Run(turn) => turn,
-            TurnWork::Attachment(_) => unreachable!("resuelto arriba"),
+            TurnWork::Attachment(_) | TurnWork::Calc(_) | TurnWork::CalcRun { .. } => {
+                unreachable!("resuelto arriba")
+            }
         };
         if let Err(error) = runtime.run(turn, &preferences).await {
             sink.emit(AgentEvent::Error {
