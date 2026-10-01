@@ -862,13 +862,9 @@ impl<'a> AgentRuntime<'a> {
                 .collect::<Vec<_>>()
                 .join("\n---\n");
             direct.push(format!("[Fuente: {}]\n{text}", tool.provider_name));
-            // La fusión por RAG solo aporta con varias KBs; con una, el RAG
-            // reparte el texto en ventanas más grandes (más prompt, más
-            // espera) y se pierden las citas «archivo › sección» de la KB.
-            if kb_ids.len() > 1
-                && self
-                    .index_document(&text, &format!("kb:{kb_id}"), None, preferences)
-                    .await
+            if self
+                .index_document(&text, &format!("kb:{kb_id}"), None, preferences)
+                .await
             {
                 any_indexed = true;
             }
