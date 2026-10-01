@@ -103,7 +103,24 @@ pub fn confirmation_is_safe(text: &str, expression: &str, result: Option<&str>) 
     if let Some(result) = result {
         allowed.extend(digit_runs(result));
     }
-    text.chars().count() <= 400 && digit_runs(text).iter().all(|n| allowed.contains(n))
+    let lower = text.to_lowercase();
+    // El modelo pequeño inventa explicaciones del cálculo ("elevar al cubo…"):
+    // la confirmación solo puede decir que se calculó o no, no cómo.
+    const NARRATION: [&str; 10] = [
+        "multiplic",
+        "dividi",
+        "divid",
+        "elev",
+        "sumar",
+        "restar",
+        "potencia",
+        "cubo",
+        "cuadrado",
+        "raíz",
+    ];
+    text.chars().count() <= 200
+        && !NARRATION.iter().any(|w| lower.contains(w))
+        && digit_runs(text).iter().all(|n| allowed.contains(n))
 }
 
 #[cfg(test)]
@@ -182,5 +199,16 @@ mod tests {
         ));
         assert!(confirmation_is_safe("No se pudo calcular.", "1/0", None));
         assert!(!confirmation_is_safe("Dio 7.", "1/0", None));
+        // Narración inventada del cálculo.
+        assert!(!confirmation_is_safe(
+            "Se calcula multiplicando por 12 y elevando al cubo el 3 para obtener 45.",
+            "(12+8)*3^2/4",
+            Some("45")
+        ));
+        assert!(confirmation_is_safe(
+            "El resultado es 45.",
+            "(12+8)*3^2/4",
+            Some("45")
+        ));
     }
 }
