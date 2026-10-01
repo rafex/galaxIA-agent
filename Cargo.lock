@@ -1132,7 +1132,7 @@ dependencies = [
 [[package]]
 name = "galaxia-fhs"
 version = "0.1.0"
-source = "git+https://github.com/rafex/galaxIA-SDK?branch=main#c16533a62d0508c4abff3035ac5ca3ff1e67aab0"
+source = "git+https://github.com/rafex/galaxIA-SDK?branch=main#4b25edabc21198e6f653544baecf117141b74db1"
 dependencies = [
  "base64 0.22.1",
  "bs58",
@@ -2181,7 +2181,7 @@ dependencies = [
 [[package]]
 name = "libp2p-websocket"
 version = "0.46.0"
-source = "git+https://github.com/rafex/galaxIA-SDK?branch=main#c16533a62d0508c4abff3035ac5ca3ff1e67aab0"
+source = "git+https://github.com/rafex/galaxIA-SDK?branch=main#4b25edabc21198e6f653544baecf117141b74db1"
 dependencies = [
  "either",
  "futures",
