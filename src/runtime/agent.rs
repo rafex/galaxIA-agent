@@ -988,17 +988,35 @@ pub enum CalcDecision {
     Expired,
 }
 
-/// Primer nodo permitido con anuncio vigente, la capacidad y conexión viva.
+/// Marca de `FHS_CALC_NODES` que acepta cualquier nodo que se anuncie con la
+/// capacidad (autodescubrimiento). La autorización del usuario por uso sigue
+/// mostrando qué nodo es y la subasta sigue siendo obligatoria (DEC-0096).
+pub const CALC_ANY_NODE: &str = "*";
+
+/// Nodo permitido con anuncio vigente, la capacidad y conexión viva. Con `*`
+/// cualquier satélite descubierto; si no, el primero de la lista.
 fn pick_calc_node(
     node: &NodeHandle,
     allowed: &[String],
 ) -> Option<crate::p2p::peer_cache::PeerEntry> {
-    allowed.iter().find_map(|did| {
-        let entry = node.peers.get(did)?;
-        let peer = crate::p2p::identity::peer_id_of_did(did).ok()?;
-        (entry.capabilities.iter().any(|c| c == calc::CAPABILITY) && node.is_connected(&peer))
-            .then_some(entry)
-    })
+    let usable = |entry: &crate::p2p::peer_cache::PeerEntry| {
+        entry.capabilities.iter().any(|c| c == calc::CAPABILITY)
+            && crate::p2p::identity::peer_id_of_did(&entry.did)
+                .is_ok_and(|peer| node.is_connected(&peer))
+    };
+    if allowed.iter().any(|d| d == CALC_ANY_NODE) {
+        let mut found: Vec<_> = node
+            .peers
+            .satellites()
+            .into_iter()
+            .filter(|e| usable(e))
+            .collect();
+        found.sort_by_key(|e| std::cmp::Reverse(e.last_seen_ms));
+        return found.into_iter().next();
+    }
+    allowed
+        .iter()
+        .find_map(|did| node.peers.get(did).filter(|e| usable(e)))
 }
 
 impl<'a> AgentRuntime<'a> {

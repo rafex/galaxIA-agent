@@ -71,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|d| d.trim().split('#').next().unwrap_or_default().to_string())
         .filter(|d| !d.is_empty())
         .collect();
-    for did in &calc_nodes {
+    for did in calc_nodes.iter().filter(|d| d.as_str() != "*") {
         p2p::identity::peer_id_of_did(did).map_err(|e| format!("FHS_CALC_NODES: {did}: {e}"))?;
     }
     if !calc_nodes.is_empty() {
