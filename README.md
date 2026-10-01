@@ -8,6 +8,14 @@ como interfaz de `CompletionModel` hacia Star.
 Es el reemplazo de `galaxIA-Core/apps/navigator` (TypeScript). Evaluación,
 fases y resultados en [`docs/migracion-desde-ts.md`](docs/migracion-desde-ts.md).
 
+## Regla de despacho
+
+> **Ningún documento autoriza despachar una misión sin oferta, puja y asignación.**
+
+El Navigator despacha cada misión a un provider con oferta → puja → asignación → stream
+directo (`galaxIA/docs/mission.md`, DEC-0096); `preferred_provider` y las listas de permitidos
+solo restringen quién puede ganar.
+
 ## Estado
 
 Navigator Rust/Rig está activo en Bastion y se ha probado contra Atlas, Star,
