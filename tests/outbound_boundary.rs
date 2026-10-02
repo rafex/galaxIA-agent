@@ -135,3 +135,55 @@ fn the_scanner_itself_detects_the_dispatcher_and_the_grant_module() {
         "{grants:?}"
     );
 }
+
+/// Código de producción: lo que hay antes del primer `#[cfg(test)]` de cada archivo.
+fn production_offenders(patterns: &[&str]) -> Vec<String> {
+    let mut files = Vec::new();
+    rust_files(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut files,
+    );
+    let mut found = Vec::new();
+    for file in files {
+        let relative = file
+            .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative.ends_with("/tests.rs") {
+            continue;
+        }
+        let source = fs::read_to_string(&file).unwrap();
+        let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+        for (index, line) in production.lines().enumerate() {
+            let text = line.trim();
+            if text.starts_with("//") {
+                continue;
+            }
+            if patterns.iter().any(|p| text.contains(p)) {
+                found.push(format!("{relative}:{}: {text}", index + 1));
+            }
+        }
+    }
+    found
+}
+
+/// SPEC-CMD-0001: ningún comando está cableado en el Navigator. Sus nombres,
+/// herramientas y capacidades salen de los anuncios y del registro cerrado.
+#[test]
+fn no_command_is_hardcoded_in_the_navigator() {
+    let found = production_offenders(&[
+        "\"/calc\"",
+        "FHS_CALC_NODES",
+        "prepare_calc",
+        "run_calc",
+        "calc-0",
+        "arithmetic_solve",
+        "math.arithmetic",
+    ]);
+    assert!(
+        found.is_empty(),
+        "estos comandos están cableados en el código:\n{}",
+        found.join("\n")
+    );
+}

@@ -64,19 +64,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|d| d.trim().split('#').next().unwrap_or_default().to_string())
         .filter(|d| !d.is_empty())
         .collect();
-    // DIDs de los nodos de cálculo permitidos: un DID inválido impide arrancar.
-    let calc_nodes: Vec<String> = std::env::var("FHS_CALC_NODES")
-        .unwrap_or_default()
-        .split(',')
-        .map(|d| d.trim().split('#').next().unwrap_or_default().to_string())
-        .filter(|d| !d.is_empty())
-        .collect();
-    for did in calc_nodes.iter().filter(|d| d.as_str() != "*") {
-        p2p::identity::peer_id_of_did(did).map_err(|e| format!("FHS_CALC_NODES: {did}: {e}"))?;
-    }
-    if !calc_nodes.is_empty() {
-        tracing::info!("nodos de cálculo permitidos: {}", calc_nodes.len());
-    }
     let ipfs = match &config.ipfs {
         Some(ipfs_config) => {
             let service = IpfsService::start(ipfs_config)?;
@@ -100,6 +87,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|d| d.trim().split('#').next().unwrap_or_default().to_string())
         .filter(|d| !d.is_empty())
         .collect();
+    // Comandos autodescubiertos (SPEC-CMD-0001): el registro cerrado y la
+    // política de admisión; un registro o un DID inválidos impiden arrancar.
+    let commands = Arc::new(galaxia_agent::runtime::commands::CommandEngine::from_env(
+        trusted_nodes.clone(),
+    )?);
+    tracing::info!(
+        "comandos: registro v{} ({}), admisión abierta: {}",
+        commands.registry.version,
+        &commands.registry.digest[..12],
+        match &commands.policy.open {
+            galaxia_agent::commands::OpenNodes::None => "ninguna".to_string(),
+            galaxia_agent::commands::OpenNodes::All => "cualquier nodo".to_string(),
+            galaxia_agent::commands::OpenNodes::List(list) => format!("{} nodos", list.len()),
+        }
+    );
     let audit_path = std::env::var("AUTH_AUDIT_PATH")
         .ok()
         .map(std::path::PathBuf::from)
@@ -125,12 +127,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         galaxia_agent::session::SessionDefaults {
             preferences: galaxia_agent::runtime::agent::Preferences {
                 vetoed: Arc::new(vetoed),
-                calc_nodes: Arc::new(calc_nodes),
                 ..Default::default()
             },
             ipfs: ipfs.clone(),
             attachment_max_bytes: config.attachment_max_bytes,
             authorizer,
+            commands,
         },
     ));
 
@@ -473,6 +475,7 @@ async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::er
                             domain: galaxia_agent::authorization::DOMAIN_TOOL_ARGS,
                             value: &arguments,
                         },
+                        contract: None,
                     },
                 )
                 .await?;

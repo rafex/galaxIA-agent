@@ -68,6 +68,8 @@ pub enum GrantError {
     ProviderMismatch,
     #[error("el permiso no cubre esta capacidad")]
     CapabilityMismatch,
+    #[error("el contrato del comando cambió desde la autorización")]
+    ContractMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -80,6 +82,17 @@ pub enum DecideError {
     BatchMismatch,
     #[error("la decisión nombra un ítem que no existe")]
     UnknownItem,
+}
+
+/// Ligadura de contexto de un comando (SPEC-CMD-0001): no son bytes enviados,
+/// pero el `Grant` los ata y el Dispatcher los revalida al consumir.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Contract {
+    /// Huella del contrato del descriptor (hex de 64).
+    pub fingerprint: String,
+    pub tool: String,
+    /// Digest del registro cerrado con el que se admitió (hex de 64).
+    pub registry_digest: String,
 }
 
 /// Un envío concreto que se pide autorizar (los bytes ya existen).
@@ -100,6 +113,8 @@ pub struct ItemSpec {
     pub failover: bool,
     pub side_effects: bool,
     pub retry: bool,
+    /// Solo los comandos.
+    pub contract: Option<Contract>,
 }
 
 impl ItemSpec {
@@ -127,6 +142,7 @@ impl ItemSpec {
             failover: false,
             side_effects: false,
             retry: false,
+            contract: None,
         }
     }
 }
@@ -156,6 +172,7 @@ struct GrantInner {
     digest: [u8; 32],
     data_class: DataClass,
     basis: Basis,
+    contract: Option<Contract>,
     expires: Instant,
     consumed: AtomicBool,
     shared: Arc<Shared>,
@@ -194,6 +211,18 @@ impl Grant {
     }
     pub fn item_id(&self) -> &str {
         &self.inner.item_id
+    }
+    pub fn contract(&self) -> Option<&Contract> {
+        self.inner.contract.as_ref()
+    }
+
+    /// El contrato vigente del nodo debe ser exactamente el autorizado.
+    pub(crate) fn verify_contract(&self, now: Option<&Contract>) -> Result<(), GrantError> {
+        if self.inner.contract.as_ref() == now {
+            Ok(())
+        } else {
+            Err(GrantError::ContractMismatch)
+        }
     }
     pub fn authorization_id(&self) -> &str {
         &self.inner.authorization_id
@@ -273,6 +302,9 @@ impl Grant {
             "data_class": inner.data_class.as_str_name(),
             "digest": hex(&inner.digest),
             "basis": inner.basis.as_str(),
+            "tool_name": inner.contract.as_ref().map(|c| c.tool.as_str()),
+            "contract_fingerprint": inner.contract.as_ref().map(|c| c.fingerprint.as_str()),
+            "registry_digest": inner.contract.as_ref().map(|c| c.registry_digest.as_str()),
         }));
         Ok(())
     }
@@ -514,6 +546,21 @@ impl Authorizer {
             side_effects: spec.side_effects,
             retry: spec.retry,
             implicit: false,
+            contract_fingerprint: spec
+                .contract
+                .as_ref()
+                .map(|c| c.fingerprint.clone())
+                .unwrap_or_default(),
+            tool_name: spec
+                .contract
+                .as_ref()
+                .map(|c| c.tool.clone())
+                .unwrap_or_default(),
+            registry_digest: spec
+                .contract
+                .as_ref()
+                .map(|c| c.registry_digest.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -608,6 +655,9 @@ impl Authorizer {
                         "provider_did": i.provider_did,
                         "data_class": i.data_class.as_str_name(),
                         "digest": hex(&i.digest),
+                        "tool_name": i.contract.as_ref().map(|c| c.tool.as_str()),
+                        "contract_fingerprint": i.contract.as_ref().map(|c| c.fingerprint.as_str()),
+                        "registry_digest": i.contract.as_ref().map(|c| c.registry_digest.as_str()),
                     })).collect::<Vec<_>>(),
                 }));
                 match tokio::time::timeout(ttl, rx).await {
@@ -747,6 +797,7 @@ impl Authorizer {
                             digest: item.digest,
                             data_class: item.data_class,
                             basis,
+                            contract: item.contract.clone(),
                             expires,
                             consumed: AtomicBool::new(false),
                             shared: self.shared.clone(),
@@ -927,6 +978,7 @@ impl Authorizer {
                 digest: digest::user_message_digest(message),
                 data_class: DataClass::UserMessage,
                 basis: Basis::Implicit,
+                contract: None,
                 expires: Instant::now() + GRANT_LIFETIME,
                 consumed: AtomicBool::new(false),
                 shared: self.shared.clone(),

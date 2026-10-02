@@ -338,6 +338,8 @@ fn star(did: &str, visibility: fhs::Visibility) -> PeerEntry {
         capabilities: vec!["chat".into()],
         last_seen_ms: 0,
         expires_at_ms: i64::MAX,
+        advert_expires_ms: i64::MAX,
+        advert_timestamp_ms: 0,
     }
 }
 
@@ -424,4 +426,86 @@ async fn trusted_and_first_time_nodes_are_derived_by_the_navigator() {
         _ => None,
     });
     assert_eq!(first, Some(false));
+}
+
+fn command_spec(fingerprint: &str) -> ItemSpec {
+    let mut item = ItemSpec::new(
+        "cmd-0",
+        "math.arithmetic.solve",
+        "did:phone",
+        "Nodo de prueba",
+        DataClass::CommandArgs,
+        "comando /calc · 1 argumento · 5 caracteres",
+        digest_of("cmd"),
+    );
+    item.contract = Some(Contract {
+        fingerprint: fingerprint.into(),
+        tool: "arithmetic_solve".into(),
+        registry_digest: "cd".repeat(32),
+    });
+    item
+}
+
+#[tokio::test]
+async fn a_command_grant_is_bound_to_its_contract_and_the_card_carries_it() {
+    let authorizer = Authorizer::for_tests();
+    let sink = Arc::new(Collected::default());
+    let fingerprint = "ab".repeat(32);
+    let (handle, id, batch) = start(
+        &authorizer,
+        sink.clone(),
+        "s1",
+        vec![command_spec(&fingerprint), spec("a", "did:ocr", &[])],
+        DEFAULT_TTL,
+    )
+    .await;
+    // La tarjeta lleva la ligadura de contexto (y solo en el ítem de comando).
+    let items = sink
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::AuthorizationRequested { items, .. } => Some(items.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let card = items.iter().find(|i| i.item_id == "cmd-0").unwrap();
+    assert_eq!(card.contract_fingerprint, fingerprint);
+    assert_eq!(card.tool_name, "arithmetic_solve");
+    assert_eq!(card.registry_digest, "cd".repeat(32));
+    let plain = items.iter().find(|i| i.item_id == "a").unwrap();
+    assert!(plain.contract_fingerprint.is_empty() && plain.tool_name.is_empty());
+
+    authorizer
+        .decide("s1", &decision(&id, batch, &[("cmd-0", true), ("a", true)]))
+        .unwrap();
+    let resolution = handle.await.unwrap().unwrap();
+    let grant = resolution.grant("cmd-0").expect("permitido").clone();
+    let same = grant.contract().cloned().unwrap();
+    assert_eq!(grant.verify_contract(Some(&same)), Ok(()));
+    // Un contrato distinto (el nodo cambió de huella) o ninguno: rechazado.
+    let mut changed = same.clone();
+    changed.fingerprint = "ef".repeat(32);
+    assert_eq!(
+        grant.verify_contract(Some(&changed)),
+        Err(GrantError::ContractMismatch)
+    );
+    let mut registry = same.clone();
+    registry.registry_digest = "00".repeat(32);
+    assert_eq!(
+        grant.verify_contract(Some(&registry)),
+        Err(GrantError::ContractMismatch)
+    );
+    assert_eq!(
+        grant.verify_contract(None),
+        Err(GrantError::ContractMismatch)
+    );
+    // Un permiso que no es de comando tampoco acepta un contrato.
+    let other = resolution.grant("a").unwrap();
+    assert_eq!(other.verify_contract(None), Ok(()));
+    assert_eq!(
+        other.verify_contract(Some(&same)),
+        Err(GrantError::ContractMismatch)
+    );
 }

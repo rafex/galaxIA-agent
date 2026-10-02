@@ -43,10 +43,11 @@ use crate::protocol::fhs::{
     AuthorizationDestination as Destination, AuthorizationRetention as Retention, DocumentContext,
     DynamicValue, Message, ToolDefinition, ToolInputSchema,
 };
-use crate::runtime::calc;
+use crate::runtime::commands::{self as engine_cmd, CommandEngine};
 use crate::runtime::events::{AgentEvent, EventSink, KbCandidate, Provenance, ToolProvenance};
 use crate::runtime::kb;
 use crate::runtime::providers::{self, LoadedTool, Scope};
+use galaxia_fhs::commands as cmd;
 
 pub const SYSTEM_PROMPT: &str = "Eres un asistente útil de una red soberana de IA comunitaria. \
 Responde siempre en español. \
@@ -60,8 +61,9 @@ const TEMPERATURE: f64 = 0.7;
 
 /// Registro de herramientas que el LLM puede pedir por su cuenta. Una que no
 /// esté aquí se deniega; las de efectos externos no están (SPEC-AUTH-0001).
-const LLM_TOOL_CAPABILITIES: [&str; 3] =
-    ["knowledge.query", "document.query", "math.arithmetic.solve"];
+/// Los comandos de chat (`/nombre`) no pasan por el LLM: los atiende la tabla
+/// de comandos autodescubiertos (SPEC-CMD-0001).
+const LLM_TOOL_CAPABILITIES: [&str; 2] = ["knowledge.query", "document.query"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RagSource {
@@ -93,8 +95,6 @@ pub struct Preferences {
     /// DIDs vetados (`FHS_VETOED_PROVIDERS`).
     pub vetoed: Arc<HashSet<String>>,
     pub ipfs: IpfsPreference,
-    /// DIDs de los nodos de cálculo permitidos (`FHS_CALC_NODES`).
-    pub calc_nodes: Arc<Vec<String>>,
 }
 
 impl Default for Preferences {
@@ -108,7 +108,6 @@ impl Default for Preferences {
             max_wait: llm::DEFAULT_LLM_TIMEOUT,
             vetoed: Arc::default(),
             ipfs: IpfsPreference::default(),
-            calc_nodes: Arc::new(Vec::new()),
         }
     }
 }
@@ -180,45 +179,6 @@ struct ResolvedLlm {
     provider_id: String,
     provider_name: String,
     model: String,
-}
-
-/// Nodo móvil elegido para un `/calc`, antes de pedir autorización.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CalcPlan {
-    pub expression: String,
-    pub node_did: String,
-    pub node_name: String,
-}
-
-/// Marca de `FHS_CALC_NODES` que acepta cualquier nodo que se anuncie con la
-/// capacidad (autodescubrimiento). La autorización del usuario por uso sigue
-/// mostrando qué nodo es y la subasta sigue siendo obligatoria (DEC-0096).
-pub const CALC_ANY_NODE: &str = "*";
-
-/// Nodo permitido con anuncio vigente, la capacidad y conexión viva. Con `*`
-/// cualquier satélite descubierto; si no, el primero de la lista.
-fn pick_calc_node(
-    node: &NodeHandle,
-    allowed: &[String],
-) -> Option<crate::p2p::peer_cache::PeerEntry> {
-    let usable = |entry: &crate::p2p::peer_cache::PeerEntry| {
-        entry.capabilities.iter().any(|c| c == calc::CAPABILITY)
-            && crate::p2p::identity::peer_id_of_did(&entry.did)
-                .is_ok_and(|peer| node.is_connected(&peer))
-    };
-    if allowed.iter().any(|d| d == CALC_ANY_NODE) {
-        let mut found: Vec<_> = node
-            .peers
-            .satellites()
-            .into_iter()
-            .filter(|e| usable(e))
-            .collect();
-        found.sort_by_key(|e| std::cmp::Reverse(e.last_seen_ms));
-        return found.into_iter().next();
-    }
-    allowed
-        .iter()
-        .find_map(|did| node.peers.get(did).filter(|e| usable(e)))
 }
 
 fn args_digest(domain: &str, value: &DynamicValue) -> Result<[u8; 32], RuntimeError> {
@@ -380,6 +340,29 @@ impl<'a> AgentRuntime<'a> {
         silent: bool,
         extra_capabilities: &[String],
     ) -> Result<Value, String> {
+        self.dispatch_tool_with(
+            grant,
+            tool,
+            outbound,
+            prefs,
+            silent,
+            extra_capabilities,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_tool_with(
+        &mut self,
+        grant: &Grant,
+        tool: &LoadedTool,
+        outbound: Outbound<'_>,
+        prefs: &Preferences,
+        silent: bool,
+        extra_capabilities: &[String],
+        contract: Option<&crate::authorization::Contract>,
+    ) -> Result<Value, String> {
         let started = Instant::now();
         if !silent {
             self.emit(AgentEvent::ToolRunning {
@@ -398,6 +381,7 @@ impl<'a> AgentRuntime<'a> {
                     provider_did: &tool.provider_id,
                     timeout: prefs.max_wait,
                     outbound,
+                    contract,
                 },
             )
             .await;
@@ -1464,118 +1448,169 @@ impl<'a> AgentRuntime<'a> {
         })
     }
 
-    // ── /calc ───────────────────────────────────────────────────────────────
+    // ── Comandos autodescubiertos (SPEC-CMD-0001) ───────────────────────────
 
-    /// `/calc`: valida y elige el nodo, sin enviar nada (DEC-0096: la
-    /// autorización del usuario va antes de publicar cualquier oferta).
-    pub async fn prepare_calc(
-        &self,
-        message: &str,
-        preferences: &Preferences,
-    ) -> Result<CalcPlan, RuntimeError> {
-        let expression =
-            calc::validate_expression(calc::parse_command(message).unwrap_or_default())
-                .map_err(|m| RuntimeError::new("INVALID_ARGUMENTS", m))?;
-        if preferences.calc_nodes.is_empty() {
-            return Err(RuntimeError::new(
-                "UNSUPPORTED_CAPABILITY",
-                "Este Navigator no tiene nodos de cálculo configurados",
-            ));
-        }
-        self.node
-            .peers
-            .settle(|_| pick_calc_node(&self.node, &preferences.calc_nodes).is_some())
-            .await;
-        let entry = pick_calc_node(&self.node, &preferences.calc_nodes).ok_or_else(|| {
-            RuntimeError::new(
-                "UNSUPPORTED_CAPABILITY",
-                "No hay un nodo móvil conectado que ofrezca el cálculo aritmético",
-            )
-        })?;
-        Ok(CalcPlan {
-            expression,
-            node_name: entry.name(),
-            node_did: entry.did,
-        })
+    /// Respuesta local del Navigator (sin red ni LLM): `/ayuda`, errores de
+    /// uso, comandos desconocidos. La procedencia es la real: sin herramientas.
+    pub fn respond_locally(&mut self, text: String) -> String {
+        self.used_tools.clear();
+        self.emit(AgentEvent::AssistantDelta { text: text.clone() });
+        self.emit(AgentEvent::AssistantCompleted {
+            provenance: Provenance {
+                llm_provider_id: String::new(),
+                llm_provider_name: String::new(),
+                model: String::new(),
+                tools: Vec::new(),
+                data_exported: false,
+                jurisdiction: "red local comunitaria".into(),
+            },
+        });
+        text
     }
 
-    /// `/calc` completo: pide autorización con la expresión, corre el ciclo
-    /// completo restringido al nodo autorizado y responde de forma
-    /// determinista. No interviene ningún LLM: la expresión y el resultado
-    /// solo van al nodo de cálculo.
-    pub async fn run_calc(
+    /// `/nombre args`: resuelve en la tabla de comandos vigentes, valida con el
+    /// descriptor, pide la autorización por uso y ejecuta con el ciclo completo
+    /// restringido al nodo autorizado. No interviene ningún LLM.
+    pub async fn run_command(
         &mut self,
-        message: &str,
+        engine: &CommandEngine,
+        name: &str,
+        rest: &str,
         preferences: &Preferences,
     ) -> Result<String, RuntimeError> {
-        self.used_tools.clear();
-        let plan = self.prepare_calc(message, preferences).await?;
-        let arguments = dynamic::from_json(&json!({ "expression": plan.expression }))
+        if engine_cmd::is_help(name) {
+            let text = engine_cmd::help_text(&engine.table(&self.node.peers));
+            return Ok(self.respond_locally(text));
+        }
+        // Durante el arranque un anuncio puede tardar un ciclo en llegar.
+        self.node
+            .peers
+            .settle(|peers| {
+                matches!(
+                    engine.table(peers).resolve(name),
+                    cmd::Resolution::Active(_)
+                )
+            })
+            .await;
+        let table = engine.table(&self.node.peers);
+        let command = match table.resolve(name) {
+            cmd::Resolution::Active(command) => command.clone(),
+            cmd::Resolution::Conflict(nodes) => {
+                return Ok(self.respond_locally(engine_cmd::conflict_text(name, nodes)));
+            }
+            cmd::Resolution::Unknown => {
+                return Ok(self.respond_locally(engine_cmd::unknown_text(name)));
+            }
+        };
+        let descriptor = &command.descriptor;
+        let args = match cmd::parse_args(descriptor, rest) {
+            Ok(args) => args,
+            Err(error) => {
+                let text = format!("{}. Uso: {}", error.message(), cmd::usage(descriptor));
+                return Ok(self.respond_locally(text));
+            }
+        };
+        let Some(entry) = engine_cmd::pick_node(&self.node, &command) else {
+            return Ok(self.respond_locally(engine_cmd::no_node_text(name)));
+        };
+        let node_did = entry.did.clone();
+        let node_name = engine_cmd::display_name(&entry);
+        let value = cmd::args_value(&args);
+        let tool_name = descriptor.tool_name.clone();
+        let capability = descriptor.capability_id.clone();
+        let command_digest = cmd::command_args_digest(&tool_name, &value)
             .map_err(|e| RuntimeError::new("INVALID_ARGUMENTS", e.to_string()))?;
+        let contract = crate::authorization::Contract {
+            fingerprint: command.fingerprint.clone(),
+            tool: tool_name.clone(),
+            registry_digest: engine.registry.digest.clone(),
+        };
+        let chars: usize = args
+            .iter()
+            .map(|(_, v)| match v {
+                cmd::ArgValue::String(s) | cmd::ArgValue::Enum(s) | cmd::ArgValue::Number(s) => {
+                    s.chars().count()
+                }
+                cmd::ArgValue::Integer(i) => i.to_string().len(),
+                cmd::ArgValue::Boolean(b) => b.to_string().len(),
+            })
+            .sum();
+        let plural = if args.len() == 1 {
+            "argumento"
+        } else {
+            "argumentos"
+        };
+        let item_id = "cmd-0";
         let mut item = ItemSpec::new(
-            "calc-0",
-            calc::CAPABILITY,
-            plan.node_did.clone(),
-            plan.node_name.clone(),
+            item_id,
+            capability.clone(),
+            node_did.clone(),
+            node_name.clone(),
             DataClass::CommandArgs,
             format!(
-                "tu expresión ({} caracteres) se envía al nodo móvil para calcularla",
-                plan.expression.chars().count()
+                "comando /{name} · {} {plural} · {chars} caracteres",
+                args.len()
             ),
-            args_digest(digest::DOMAIN_COMMAND_ARGS, &arguments)?,
+            command_digest,
         );
-        item.destination = self.destination_of(&plan.node_did);
+        item.destination = self.destination_of(&node_did);
+        item.contract = Some(contract.clone());
+        self.used_tools.clear();
         let resolution = self.ask(vec![item]).await?;
 
-        let line = match resolution.grant("calc-0").cloned() {
-            None => match Self::denial(&resolution, "calc-0").code {
-                "AUTHORIZATION_EXPIRED" => {
-                    "No se calculó: la autorización venció. No se envió nada al nodo.".to_string()
-                }
-                _ => {
-                    "No se calculó: no autorizaste el envío. No se envió nada al nodo.".to_string()
-                }
+        let line = match resolution.grant(item_id).cloned() {
+            None => match Self::denial(&resolution, item_id).code {
+                "AUTHORIZATION_EXPIRED" => format!(
+                    "No se ejecutó /{name}: la autorización venció. No se envió nada al nodo."
+                ),
+                _ => format!(
+                    "No se ejecutó /{name}: no autorizaste el envío. No se envió nada al nodo."
+                ),
             },
             Some(grant) => {
                 self.emit(AgentEvent::ToolSelected {
-                    capability: calc::CAPABILITY.into(),
-                    provider_id: plan.node_did.clone(),
+                    capability: capability.clone(),
+                    provider_id: node_did.clone(),
                 });
                 let tool = LoadedTool {
-                    name: calc::TOOL.into(),
-                    capability: calc::CAPABILITY.into(),
-                    provider_id: plan.node_did.clone(),
-                    provider_name: plan.node_name.clone(),
+                    name: tool_name.clone(),
+                    capability: capability.clone(),
+                    provider_id: node_did.clone(),
+                    provider_name: node_name.clone(),
                     description: String::new(),
                 };
                 let mut limited = preferences.clone();
                 limited.max_wait = preferences.max_wait.min(Duration::from_secs(15));
+                let shown = rest.trim();
                 match self
-                    .dispatch_tool(
+                    .dispatch_tool_with(
                         &grant,
                         &tool,
-                        Outbound::Args {
-                            domain: digest::DOMAIN_COMMAND_ARGS,
-                            value: &arguments,
+                        Outbound::Command {
+                            tool: &tool_name,
+                            args: &value,
                         },
                         &limited,
                         true,
                         &[],
+                        Some(&contract),
                     )
                     .await
                 {
-                    Ok(result) => match calc::validate_result(&result) {
-                        Ok(n) => {
-                            format!(
-                                "Resultado: {} = {n} (calculado por el nodo móvil)",
-                                plan.expression
-                            )
+                    Ok(result) => {
+                        let outcome = dynamic::from_json(&result)
+                            .map_err(|e| e.to_string())
+                            .and_then(|v| cmd::validate_result(descriptor, &v));
+                        match outcome {
+                            Ok(text) => {
+                                format!("Resultado de /{name}: {shown} → {text} (por {node_name})")
+                            }
+                            Err(text) => format!("No se pudo ejecutar /{name}: {text}"),
                         }
-                        Err(text) => format!("No se pudo calcular {}: {text}", plan.expression),
-                    },
+                    }
                     Err(error) => {
-                        let text = calc::error_text(&error);
-                        format!("No se pudo calcular {}: {text}", plan.expression)
+                        let text = engine.error_text(&capability, &error);
+                        format!("No se pudo ejecutar /{name}: {text}")
                     }
                 }
             }

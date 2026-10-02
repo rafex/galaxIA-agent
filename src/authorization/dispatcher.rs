@@ -54,6 +54,12 @@ pub enum Outbound<'a> {
         domain: &'static str,
         value: &'a DynamicValue,
     },
+    /// Un comando (SPEC-CMD-0001): el digest es el cv1 de `{ args, tool }` y los
+    /// argumentos que salen son `args`. `spec.tool_name` debe ser `tool`.
+    Command {
+        tool: &'a str,
+        args: &'a DynamicValue,
+    },
     /// Un archivo: los argumentos son `{file: artifact}` y el digest es el de
     /// los bytes reales. Un artefacto IPFS debe ser uno que este Dispatcher
     /// subió con permiso y con esos mismos bytes.
@@ -71,6 +77,8 @@ pub struct ToolCallSpec<'a> {
     pub provider_did: &'a str,
     pub timeout: Duration,
     pub outbound: Outbound<'a>,
+    /// Contrato vigente del nodo, solo para comandos: debe ser el autorizado.
+    pub contract: Option<&'a super::Contract>,
 }
 
 /// Fragmentos derivados (texto de KB, RAG, documento) que van al LLM.
@@ -210,6 +218,17 @@ impl Dispatcher {
             Outbound::Args { domain, value } => {
                 (value.clone(), digest::value_digest(domain, value)?)
             }
+            Outbound::Command { tool, args } => {
+                if tool != spec.tool_name {
+                    return Err(DispatchError::Digest(
+                        "la herramienta no es la del comando autorizado".into(),
+                    ));
+                }
+                (
+                    args.clone(),
+                    galaxia_fhs::commands::command_args_digest(tool, args)?,
+                )
+            }
             Outbound::Document { artifact, bytes } => {
                 let digest_now = digest::document_digest(bytes);
                 if let Some(artifact_ref::Transport::Ipfs(ipfs)) = &artifact.transport {
@@ -228,6 +247,7 @@ impl Dispatcher {
                 (file_arguments(artifact), digest_now)
             }
         };
+        grant.verify_contract(spec.contract)?;
         grant.consume(spec.capability, spec.provider_did, digest_now)?;
         let did = grant.provider_did().to_string();
         let outcome = client::call_tool(

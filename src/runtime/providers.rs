@@ -192,6 +192,7 @@ mod tests {
                 ..Default::default()
             }),
             ttl_seconds: 60,
+            timestamp: crate::p2p::peer_cache::now_ms(),
             ..Default::default()
         });
         cache

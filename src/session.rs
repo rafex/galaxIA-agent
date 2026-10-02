@@ -31,9 +31,10 @@ use crate::protocol::fhs::{
 use crate::runtime::agent::{
     AgentRuntime, AuthContext, IpfsPreference, IpfsTurn, Preferences, RagSource, Turn,
 };
-use crate::runtime::calc;
+use crate::runtime::commands::CommandEngine;
 use crate::runtime::events::{AgentEvent, EventSink};
 use crate::runtime::providers::Scope;
+use galaxia_fhs::commands::{classify_line, LineKind};
 
 /// Valores por defecto de cada sesión (vetos, espera máxima) y recursos
 /// compartidos.
@@ -46,6 +47,8 @@ pub struct SessionDefaults {
     pub attachment_max_bytes: usize,
     /// Emisor único de permisos y tabla de decisiones pendientes.
     pub authorizer: Authorizer,
+    /// Registro cerrado y política de los comandos autodescubiertos.
+    pub commands: Arc<CommandEngine>,
 }
 
 impl Default for SessionDefaults {
@@ -55,6 +58,7 @@ impl Default for SessionDefaults {
             ipfs: None,
             attachment_max_bytes: crate::config::DEFAULT_ATTACHMENT_MAX_BYTES,
             authorizer: Authorizer::for_tests(),
+            commands: Arc::new(CommandEngine::closed(HashSet::new())),
         }
     }
 }
@@ -184,6 +188,7 @@ struct SessionState {
     ipfs: Option<IpfsService>,
     attachment_max_bytes: usize,
     authorizer: Authorizer,
+    commands: Arc<CommandEngine>,
 }
 
 /// Acepta sesiones del Portal mientras el nodo exista.
@@ -263,7 +268,28 @@ async fn run_session(
         ipfs: defaults.ipfs.clone(),
         attachment_max_bytes: defaults.attachment_max_bytes,
         authorizer: defaults.authorizer.clone(),
+        commands: defaults.commands.clone(),
     }));
+    // `commands.available` (SPEC-CMD-0001): tras el handshake y en cada cambio
+    // de la tabla, incluidas las bajas por TTL.
+    let feed = Arc::new(CommandsFeed::new(defaults.commands.clone()));
+    if let Some(message) = feed.snapshot(&node.peers, true) {
+        let _ = tx.send(Payload::CommandsAvailable(message));
+    }
+    let watcher = {
+        let (feed, tx, node) = (feed.clone(), tx.clone(), node.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                if let Some(message) = feed.snapshot(&node.peers, false) {
+                    if tx.send(Payload::CommandsAvailable(message)).is_err() {
+                        break;
+                    }
+                }
+            }
+        })
+    };
     loop {
         let envelope = match framing::read_verified(&mut reader).await {
             Ok(Some(envelope)) => envelope,
@@ -303,6 +329,11 @@ async fn run_session(
                     authorizer.status(&session, &request.authorization_id),
                 ));
             }
+            Some(Payload::CommandsListRequest(_)) => {
+                if let Some(message) = feed.snapshot(&node.peers, true) {
+                    let _ = tx.send(Payload::CommandsAvailable(message));
+                }
+            }
             Some(Payload::ChatCancel(cancel)) => {
                 let handles: Vec<JoinHandle<()>> = {
                     let mut s = state.lock().expect("session");
@@ -335,6 +366,7 @@ async fn run_session(
             handle.abort();
         }
     }
+    watcher.abort();
     drop(tx);
     let _ = writer_task.await;
     tracing::info!(
@@ -359,7 +391,6 @@ fn preferences_from_start(start: &AgentStartMessage, defaults: &Preferences) -> 
         },
         max_wait: defaults.max_wait,
         vetoed: defaults.vetoed.clone(),
-        calc_nodes: defaults.calc_nodes.clone(),
         ipfs: IpfsPreference {
             enabled: start.ipfs_enabled,
             network: start.ipfs_network.clone(),
@@ -390,13 +421,50 @@ fn validate_artifacts(artifacts: &[ArtifactRef], max_bytes: usize) -> Result<(),
     }
 }
 
+/// Última lista de comandos enviada a la sesión y su `revision` (monótona por
+/// sesión).
+struct CommandsFeed {
+    engine: Arc<CommandEngine>,
+    last: Mutex<(i64, Vec<fhs::CommandSummary>)>,
+}
+
+impl CommandsFeed {
+    fn new(engine: Arc<CommandEngine>) -> Self {
+        Self {
+            engine,
+            last: Mutex::new((0, Vec::new())),
+        }
+    }
+
+    /// Mensaje a enviar si la tabla cambió (revisión nueva) o si se fuerza
+    /// (tras el handshake o ante un `commands.list_request`).
+    fn snapshot(
+        &self,
+        peers: &crate::p2p::peer_cache::PeerCache,
+        force: bool,
+    ) -> Option<fhs::CommandsAvailableMessage> {
+        let summaries = self.engine.table(peers).summaries();
+        let mut last = self.last.lock().expect("commands feed");
+        if last.0 == 0 || summaries != last.1 {
+            last.0 += 1;
+            last.1 = summaries.clone();
+        } else if !force {
+            return None;
+        }
+        Some(fhs::CommandsAvailableMessage {
+            revision: last.0,
+            commands: summaries,
+        })
+    }
+}
+
 enum TurnWork {
     /// Adjunto nuevo: OCR y, según la fuente de RAG, indexar y seguir.
     Attachment(Turn),
     /// Responder (KB, RAG y contexto piden su propia autorización).
     Run(Turn),
-    /// `/calc`: valida, pide autorización y calcula en el nodo móvil.
-    Calc(Turn),
+    /// `/nombre args`: comando autodescubierto (SPEC-CMD-0001).
+    Command { name: String, rest: String },
 }
 
 fn handle_chat(
@@ -459,14 +527,28 @@ fn handle_chat(
         document_id,
         rag_active,
     };
-    let work = if turn.artifacts.is_empty() && calc::parse_command(&turn.message).is_some() {
-        TurnWork::Calc(turn)
-    } else if turn.artifacts.is_empty() {
-        TurnWork::Run(turn)
-    } else {
-        TurnWork::Attachment(turn)
-    };
+    let work = route(turn);
     spawn_turn(node, state, tx, conversation, work, preferences);
+}
+
+/// Decide quién atiende el turno. Un `/nombre` nunca llega al LLM: lo atiende
+/// la tabla de comandos; `//texto` es el escape para enviar el literal.
+fn route(mut turn: Turn) -> TurnWork {
+    if !turn.artifacts.is_empty() {
+        return TurnWork::Attachment(turn);
+    }
+    match classify_line(&turn.message) {
+        LineKind::Plain => TurnWork::Run(turn),
+        // `//texto` se envía como el literal `/texto` al Star elegido (P5).
+        LineKind::Escaped(text) => {
+            turn.message = text.to_string();
+            TurnWork::Run(turn)
+        }
+        LineKind::Command { name, rest } => TurnWork::Command {
+            name,
+            rest: rest.to_string(),
+        },
+    }
 }
 
 fn spawn_turn(
@@ -482,9 +564,14 @@ fn spawn_turn(
     let task_state = state.clone();
     let id = conversation.clone();
     let turn_id = Uuid::new_v4().to_string();
-    let (service, session_key, authorizer) = {
+    let (service, session_key, authorizer, commands) = {
         let s = state.lock().expect("session");
-        (s.ipfs.clone(), s.key.clone(), s.authorizer.clone())
+        (
+            s.ipfs.clone(),
+            s.key.clone(),
+            s.authorizer.clone(),
+            s.commands.clone(),
+        )
     };
     let ipfs_turn = IpfsTurn {
         guard: service.as_ref().map(|svc| svc.release_guard(&turn_id)),
@@ -504,8 +591,11 @@ fn spawn_turn(
         };
         let mut runtime = AgentRuntime::new(node, &sink, id.clone(), auth).with_ipfs(ipfs_turn);
         let turn = match work {
-            TurnWork::Calc(turn) => {
-                if let Err(error) = runtime.run_calc(&turn.message, &preferences).await {
+            TurnWork::Command { name, rest } => {
+                if let Err(error) = runtime
+                    .run_command(&commands, &name, &rest, &preferences)
+                    .await
+                {
                     sink.emit(AgentEvent::Error {
                         code: error.code.into(),
                         message: error.message,
@@ -604,6 +694,71 @@ async fn attachment(
 mod tests {
     use super::*;
     use crate::runtime::events::{Provenance, ToolProvenance};
+
+    fn turn(message: &str, with_file: bool) -> Turn {
+        Turn {
+            message: message.into(),
+            artifacts: if with_file {
+                vec![ArtifactRef::default()]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_slash_message_never_reaches_the_llm_unless_escaped() {
+        // Texto normal: al LLM como siempre.
+        assert!(matches!(route(turn("hola", false)), TurnWork::Run(t) if t.message == "hola"));
+        // `/nombre`, conocido o no, lo atiende la tabla de comandos.
+        for line in [
+            "/leer",
+            "/calc 2+2",
+            "/CALC 2+2",
+            "/ayuda",
+            "/etc/passwd dime",
+            "/",
+        ] {
+            assert!(
+                matches!(route(turn(line, false)), TurnWork::Command { .. }),
+                "{line} no debía ir al LLM"
+            );
+        }
+        // `//texto` es el escape: se envía como el literal `/texto`.
+        assert!(
+            matches!(route(turn("//leer algo", false)), TurnWork::Run(t) if t.message == "/leer algo")
+        );
+        // Con adjunto el turno es de OCR, no de comando.
+        assert!(matches!(
+            route(turn("/calc 2+2", true)),
+            TurnWork::Attachment(_)
+        ));
+        match route(turn("  /Calc   1 + 1  ", false)) {
+            TurnWork::Command { name, rest } => {
+                assert_eq!(name, "calc");
+                assert_eq!(rest, "   1 + 1");
+            }
+            _ => panic!("debía ser un comando"),
+        }
+    }
+
+    #[test]
+    fn commands_feed_bumps_the_revision_only_when_the_table_changes() {
+        let feed = CommandsFeed::new(Arc::new(CommandEngine::closed(HashSet::new())));
+        let peers = crate::p2p::peer_cache::PeerCache::default();
+        let first = feed.snapshot(&peers, true).expect("primer envío");
+        assert_eq!(first.revision, 1);
+        assert!(first.commands.is_empty());
+        assert!(
+            feed.snapshot(&peers, false).is_none(),
+            "sin cambios no se envía"
+        );
+        let again = feed
+            .snapshot(&peers, true)
+            .expect("forzado tras reconectar");
+        assert_eq!(again.revision, 1, "la revisión no avanza sin cambios");
+    }
 
     #[test]
     fn maps_events_to_portal_payloads() {
