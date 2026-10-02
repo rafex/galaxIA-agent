@@ -2,10 +2,15 @@
 //! `portal-session.ts`.
 //!
 //! El navegador abre un stream al Navigator, hace handshake y manda
-//! `agentStart`, `chatRequest`, `kbDecision` y `chatCancel`. Cada turno corre
-//! en su propia tarea para que la sesión siga leyendo (cancelar, confirmar
-//! KB) mientras el LLM responde. A diferencia del TS, `chatCancel` aborta de
-//! verdad el turno en curso.
+//! `agentStart`, `chatRequest`, `authorization.decision` y `chatCancel`. Cada
+//! turno corre en su propia tarea para que la sesión siga leyendo (cancelar,
+//! decidir una autorización) mientras el LLM responde. A diferencia del TS,
+//! `chatCancel` aborta de verdad el turno en curso.
+//!
+//! Autorización por uso (SPEC-AUTH-0001): el runtime pide la autorización y
+//! la espera; esta sesión solo transporta `authorization.requested` hacia el
+//! Portal y entrega la decisión al [`Authorizer`], que la consume una vez y
+//! solo para esta sesión.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -16,6 +21,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::authorization::Authorizer;
 use crate::ipfs::IpfsService;
 use crate::p2p::{framing, node::NodeHandle, peer_cache::now_ms, wire};
 use crate::protocol::fhs::{
@@ -23,10 +29,10 @@ use crate::protocol::fhs::{
     FhsErrorCode, HandshakeAckMessage,
 };
 use crate::runtime::agent::{
-    AgentRuntime, CalcDecision, CalcPlan, IpfsPreference, IpfsTurn, Preferences, RagSource, Turn,
+    AgentRuntime, AuthContext, IpfsPreference, IpfsTurn, Preferences, RagSource, Turn,
 };
 use crate::runtime::calc;
-use crate::runtime::events::{AgentEvent, EventSink, KbCandidate};
+use crate::runtime::events::{AgentEvent, EventSink};
 use crate::runtime::providers::Scope;
 
 /// Valores por defecto de cada sesión (vetos, espera máxima) y recursos
@@ -38,6 +44,8 @@ pub struct SessionDefaults {
     pub ipfs: Option<IpfsService>,
     /// Tope de un adjunto (`ATTACHMENT_MAX_BYTES`).
     pub attachment_max_bytes: usize,
+    /// Emisor único de permisos y tabla de decisiones pendientes.
+    pub authorizer: Authorizer,
 }
 
 impl Default for SessionDefaults {
@@ -46,6 +54,7 @@ impl Default for SessionDefaults {
             preferences: Preferences::default(),
             ipfs: None,
             attachment_max_bytes: crate::config::DEFAULT_ATTACHMENT_MAX_BYTES,
+            authorizer: Authorizer::for_tests(),
         }
     }
 }
@@ -91,20 +100,29 @@ impl EventSink for SessionSink {
                     text,
                 })
             }
-            AgentEvent::KbRecommended {
-                candidates,
-                chosen_by_llm,
-            } => Payload::KbRecommended(fhs::KbRecommendedMessage {
-                mission_id,
-                candidates: candidates
-                    .into_iter()
-                    .map(|c| fhs::KbCandidate {
-                        provider_id: c.provider_id,
-                        provider_name: c.provider_name,
-                        description: c.description,
-                    })
-                    .collect(),
-                chosen_by_llm,
+            AgentEvent::AuthorizationRequested {
+                authorization_id,
+                conversation_id,
+                turn_id,
+                expires_at,
+                batch_digest,
+                items,
+            } => Payload::AuthorizationRequested(fhs::AuthorizationRequestedMessage {
+                authorization_id,
+                conversation_id,
+                turn_id,
+                expires_at,
+                batch_digest,
+                items,
+            }),
+            AgentEvent::AuthorizationResolved {
+                authorization_id,
+                outcome,
+                items,
+            } => Payload::AuthorizationResolved(fhs::AuthorizationResolvedMessage {
+                authorization_id,
+                outcome,
+                items,
             }),
             AgentEvent::AssistantCompleted { provenance } => {
                 Payload::AssistantCompleted(fhs::AssistantCompletedMessage {
@@ -144,6 +162,10 @@ fn error_payload(mission_id: &str, code: &str, message: &str) -> Payload {
         "OVERLOADED" => FhsErrorCode::Overloaded,
         "UNSUPPORTED_CAPABILITY" => FhsErrorCode::UnsupportedCapability,
         "UPSTREAM_UNAVAILABLE" => FhsErrorCode::UpstreamUnavailable,
+        // Sin autorización no se envía nada: no es un fallo interno.
+        "AUTHORIZATION_DENIED" | "AUTHORIZATION_EXPIRED" | "AUTHORIZATION_CANCELLED" => {
+            FhsErrorCode::Unauthorized
+        }
         _ => FhsErrorCode::InternalError,
     };
     Payload::Error(fhs::ErrorMessage {
@@ -152,37 +174,16 @@ fn error_payload(mission_id: &str, code: &str, message: &str) -> Payload {
     })
 }
 
-struct Pending {
-    turn: Turn,
-    preferences: Preferences,
-    candidates: Vec<KbCandidate>,
-    /// Autorización de un comando `/calc` (en vez de una recomendación de KB).
-    calc: Option<CalcPending>,
-}
-
-struct CalcPending {
-    plan: CalcPlan,
-    authorization_id: String,
-    expires_at: std::time::Instant,
-}
-
-/// Cuánto espera la autorización de un comando antes de darla por rechazada.
-const CALC_AUTHORIZATION_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-/// Marca del `description` con la que el Portal pinta una autorización de
-/// comando en vez de una recomendación de KB (deuda: migrar a
-/// `tool.authorization.*` del IDL).
-pub const CALC_AUTHORIZATION_MARKER: &str = "[autorización /calc] ";
-
 struct SessionState {
     /// Clave de la sesión (stream) para las cuotas de IPFS.
     key: String,
     session_id: Option<String>,
     preferences: Preferences,
     rag_active: HashSet<String>,
-    pending: HashMap<String, Pending>,
     active: HashMap<String, JoinHandle<()>>,
     ipfs: Option<IpfsService>,
     attachment_max_bytes: usize,
+    authorizer: Authorizer,
 }
 
 /// Acepta sesiones del Portal mientras el nodo exista.
@@ -258,10 +259,10 @@ async fn run_session(
         session_id: None,
         preferences: defaults.preferences.clone(),
         rag_active: HashSet::new(),
-        pending: HashMap::new(),
         active: HashMap::new(),
         ipfs: defaults.ipfs.clone(),
         attachment_max_bytes: defaults.attachment_max_bytes,
+        authorizer: defaults.authorizer.clone(),
     }));
     loop {
         let envelope = match framing::read_verified(&mut reader).await {
@@ -282,58 +283,25 @@ async fn run_session(
                 s.preferences = preferences_from_start(&start, &defaults.preferences);
             }
             Some(Payload::ChatRequest(request)) => handle_chat(&node, &state, &tx, request),
-            Some(Payload::KbDecision(decision)) => {
-                let decision_id = decision.mission_id.clone();
-                let pending = state
-                    .lock()
-                    .expect("session")
-                    .pending
-                    .remove(&decision.mission_id);
-                if let Some(pending) = pending {
-                    if let Some(calc) = pending.calc {
-                        // Una sola vez y antes de vencer; si no, es rechazo.
-                        let decision =
-                            if decision.r#use && calc.expires_at > std::time::Instant::now() {
-                                CalcDecision::Authorized {
-                                    authorization_id: calc.authorization_id,
-                                }
-                            } else if decision.r#use {
-                                CalcDecision::Expired
-                            } else {
-                                CalcDecision::Declined
-                            };
-                        spawn_turn(
-                            &node,
-                            &state,
-                            &tx,
-                            decision_id.clone(),
-                            TurnWork::CalcRun {
-                                plan: calc.plan,
-                                decision,
-                            },
-                            pending.preferences,
-                        );
-                        continue;
-                    }
-                    let mut turn = pending.turn;
-                    turn.kb_provider_ids = if decision.r#use {
-                        pending
-                            .candidates
-                            .into_iter()
-                            .map(|c| c.provider_id)
-                            .collect()
-                    } else {
-                        vec![]
-                    };
-                    spawn_turn(
-                        &node,
-                        &state,
-                        &tx,
-                        decision.mission_id,
-                        TurnWork::Run(turn),
-                        pending.preferences,
-                    );
+            Some(Payload::AuthorizationDecision(decision)) => {
+                let (authorizer, session) = {
+                    let s = state.lock().expect("session");
+                    (s.authorizer.clone(), s.key.clone())
+                };
+                // La decisión se usa una sola vez y solo en esta sesión; las
+                // desconocidas, repetidas o de otro lote se ignoran.
+                if let Err(error) = authorizer.decide(&session, &decision) {
+                    tracing::warn!("[portal-session] decisión de autorización ignorada: {error}");
                 }
+            }
+            Some(Payload::AuthorizationStatusRequest(request)) => {
+                let (authorizer, session) = {
+                    let s = state.lock().expect("session");
+                    (s.authorizer.clone(), s.key.clone())
+                };
+                let _ = tx.send(Payload::AuthorizationResolved(
+                    authorizer.status(&session, &request.authorization_id),
+                ));
             }
             Some(Payload::ChatCancel(cancel)) => {
                 let handles: Vec<JoinHandle<()>> = {
@@ -343,7 +311,7 @@ async fn run_session(
                     } else {
                         cancel.mission_id.clone()
                     };
-                    s.pending.remove(&id);
+                    s.authorizer.cancel_conversation(&s.key, &id);
                     s.active.remove(&id).into_iter().collect()
                 };
                 for handle in handles {
@@ -360,8 +328,12 @@ async fn run_session(
             _ => {}
         }
     }
-    for (_, handle) in state.lock().expect("session").active.drain() {
-        handle.abort();
+    {
+        let mut s = state.lock().expect("session");
+        s.authorizer.cancel_session(&s.key);
+        for (_, handle) in s.active.drain() {
+            handle.abort();
+        }
     }
     drop(tx);
     let _ = writer_task.await;
@@ -421,17 +393,10 @@ fn validate_artifacts(artifacts: &[ArtifactRef], max_bytes: usize) -> Result<(),
 enum TurnWork {
     /// Adjunto nuevo: OCR y, según la fuente de RAG, indexar y seguir.
     Attachment(Turn),
-    /// Resolver KB (recomendar o usar la manual) y luego responder.
-    ResolveKb(Turn),
-    /// Responder con las KBs ya decididas.
+    /// Responder (KB, RAG y contexto piden su propia autorización).
     Run(Turn),
-    /// `/calc`: validar, elegir el nodo y pedir autorización.
+    /// `/calc`: valida, pide autorización y calcula en el nodo móvil.
     Calc(Turn),
-    /// `/calc` ya decidido por el usuario (o por el tiempo).
-    CalcRun {
-        plan: CalcPlan,
-        decision: CalcDecision,
-    },
 }
 
 fn handle_chat(
@@ -492,13 +457,12 @@ fn handle_chat(
             .clone()
             .filter(|c: &DocumentContext| !c.chunks.is_empty()),
         document_id,
-        kb_provider_ids: vec![],
         rag_active,
     };
     let work = if turn.artifacts.is_empty() && calc::parse_command(&turn.message).is_some() {
         TurnWork::Calc(turn)
     } else if turn.artifacts.is_empty() {
-        TurnWork::ResolveKb(turn)
+        TurnWork::Run(turn)
     } else {
         TurnWork::Attachment(turn)
     };
@@ -518,13 +482,18 @@ fn spawn_turn(
     let task_state = state.clone();
     let id = conversation.clone();
     let turn_id = Uuid::new_v4().to_string();
-    let (service, session_key) = {
+    let (service, session_key, authorizer) = {
         let s = state.lock().expect("session");
-        (s.ipfs.clone(), s.key.clone())
+        (s.ipfs.clone(), s.key.clone(), s.authorizer.clone())
     };
     let ipfs_turn = IpfsTurn {
         guard: service.as_ref().map(|svc| svc.release_guard(&turn_id)),
         service: service.clone(),
+        session: session_key.clone(),
+        turn_id: turn_id.clone(),
+    };
+    let auth = AuthContext {
+        authorizer,
         session: session_key,
         turn_id: turn_id.clone(),
     };
@@ -533,86 +502,10 @@ fn spawn_turn(
             tx: tx.clone(),
             conversation: id.clone(),
         };
-        let mut runtime = AgentRuntime::new(node, &sink, id.clone()).with_ipfs(ipfs_turn);
-        let work = match work {
+        let mut runtime = AgentRuntime::new(node, &sink, id.clone(), auth).with_ipfs(ipfs_turn);
+        let turn = match work {
             TurnWork::Calc(turn) => {
-                match runtime.prepare_calc(&turn.message, &preferences).await {
-                    Ok(plan) => {
-                        let authorization_id = Uuid::new_v4().to_string();
-                        let candidate = KbCandidate {
-                            provider_id: plan.node_did.clone(),
-                            provider_name: plan.node_name.clone(),
-                            description: format!(
-                                "{CALC_AUTHORIZATION_MARKER}Se publicará una oferta y se enviará la expresión «{}» al nodo móvil {}",
-                                plan.expression, plan.node_name
-                            ),
-                        };
-                        task_state.lock().expect("session").pending.insert(
-                            id.clone(),
-                            Pending {
-                                turn,
-                                preferences: preferences.clone(),
-                                candidates: vec![],
-                                calc: Some(CalcPending {
-                                    plan,
-                                    authorization_id: authorization_id.clone(),
-                                    expires_at: std::time::Instant::now() + CALC_AUTHORIZATION_TTL,
-                                }),
-                            },
-                        );
-                        sink.emit(AgentEvent::KbRecommended {
-                            candidates: vec![candidate],
-                            chosen_by_llm: false,
-                        });
-                        // Vencimiento: quita el pendiente (si nadie lo consumió)
-                        // y responde sin enviar nada.
-                        let (node, state, tx) =
-                            (runtime.node().clone(), task_state.clone(), tx.clone());
-                        let conversation = id.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(CALC_AUTHORIZATION_TTL).await;
-                            let expired = {
-                                let mut s = state.lock().expect("session");
-                                let same = s.pending.get(&conversation).is_some_and(|p| {
-                                    p.calc
-                                        .as_ref()
-                                        .is_some_and(|c| c.authorization_id == authorization_id)
-                                });
-                                if same {
-                                    s.pending.remove(&conversation)
-                                } else {
-                                    None
-                                }
-                            };
-                            if let Some(Pending {
-                                calc: Some(calc),
-                                preferences,
-                                ..
-                            }) = expired
-                            {
-                                spawn_turn(
-                                    &node,
-                                    &state,
-                                    &tx,
-                                    conversation,
-                                    TurnWork::CalcRun {
-                                        plan: calc.plan,
-                                        decision: CalcDecision::Expired,
-                                    },
-                                    preferences,
-                                );
-                            }
-                        });
-                    }
-                    Err(error) => sink.emit(AgentEvent::Error {
-                        code: error.code.into(),
-                        message: error.message,
-                    }),
-                }
-                return;
-            }
-            TurnWork::CalcRun { plan, decision } => {
-                if let Err(error) = runtime.run_calc(plan, decision, &preferences).await {
+                if let Err(error) = runtime.run_calc(&turn.message, &preferences).await {
                     sink.emit(AgentEvent::Error {
                         code: error.code.into(),
                         message: error.message,
@@ -621,50 +514,16 @@ fn spawn_turn(
                 task_state.lock().expect("session").active.remove(&id);
                 return;
             }
-            other => other,
-        };
-        let turn = match work {
             TurnWork::Attachment(turn) => {
                 match attachment(&mut runtime, &sink, &task_state, turn, &preferences).await {
-                    Some(turn) => TurnWork::ResolveKb(turn),
-                    None => return,
-                }
-            }
-            other => other,
-        };
-        let turn = match turn {
-            TurnWork::ResolveKb(mut turn) => {
-                if !preferences.kb.is_empty() {
-                    turn.kb_provider_ids = vec![preferences.kb.clone()];
-                    turn
-                } else {
-                    let (candidates, chosen_by_llm) = runtime
-                        .resolve_kb_candidates(&turn.message, &preferences)
-                        .await;
-                    if candidates.is_empty() {
-                        turn
-                    } else {
-                        task_state.lock().expect("session").pending.insert(
-                            id.clone(),
-                            Pending {
-                                turn,
-                                preferences: preferences.clone(),
-                                candidates: candidates.clone(),
-                                calc: None,
-                            },
-                        );
-                        sink.emit(AgentEvent::KbRecommended {
-                            candidates,
-                            chosen_by_llm,
-                        });
+                    Some(turn) => turn,
+                    None => {
+                        task_state.lock().expect("session").active.remove(&id);
                         return;
                     }
                 }
             }
             TurnWork::Run(turn) => turn,
-            TurnWork::Attachment(_) | TurnWork::Calc(_) | TurnWork::CalcRun { .. } => {
-                unreachable!("resuelto arriba")
-            }
         };
         if let Err(error) = runtime.run(turn, &preferences).await {
             sink.emit(AgentEvent::Error {
@@ -696,7 +555,7 @@ async fn attachment(
     preferences: &Preferences,
 ) -> Option<Turn> {
     let artifact: ArtifactRef = turn.artifacts.first()?.clone();
-    let (filename, text) = match runtime.extract_ocr_text(&artifact, preferences).await {
+    let (filename, text) = match runtime.process_attachment(&artifact, preferences).await {
         Ok(result) => result,
         Err(error) => {
             sink.emit(AgentEvent::Error {

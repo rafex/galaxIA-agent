@@ -71,9 +71,20 @@ pub enum AgentEvent {
         filename: String,
         text: String,
     },
-    KbRecommended {
-        candidates: Vec<KbCandidate>,
-        chosen_by_llm: bool,
+    /// `authorization.requested` hacia el cliente (SPEC-AUTH-0001).
+    AuthorizationRequested {
+        authorization_id: String,
+        conversation_id: String,
+        turn_id: String,
+        expires_at: i64,
+        batch_digest: Vec<u8>,
+        items: Vec<crate::protocol::fhs::AuthorizationItem>,
+    },
+    /// `authorization.resolved`: lote y estado por ítem.
+    AuthorizationResolved {
+        authorization_id: String,
+        outcome: i32,
+        items: Vec<crate::protocol::fhs::AuthorizationItemStatus>,
     },
     Error {
         code: String,

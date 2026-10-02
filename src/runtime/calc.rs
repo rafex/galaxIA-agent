@@ -89,6 +89,30 @@ pub fn math_error_text(code: &str) -> &'static str {
     }
 }
 
+/// Texto propio del Navigator para un error de la misión de `/calc`. Si el
+/// error trae uno de los códigos `MATH_*` del contrato se traduce; el texto del
+/// nodo nunca se muestra.
+pub fn error_text(error: &str) -> String {
+    for code in [
+        "MATH_DIVISION_BY_ZERO",
+        "MATH_NOT_FINITE",
+        "MATH_SYNTAX",
+        "MATH_TIMEOUT",
+        "MATH_LIMIT",
+    ] {
+        if error.contains(code) {
+            return math_error_text(code).to_string();
+        }
+    }
+    if error.contains("no pujó") || error.contains("no hay providers") {
+        "el nodo móvil no pujó (¿sigue conectado y con la página visible?)".to_string()
+    } else if error.contains("tiempo agotado") {
+        "el nodo móvil tardó demasiado".to_string()
+    } else {
+        "no se pudo completar la misión con el nodo móvil".to_string()
+    }
+}
+
 fn digit_runs(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_ascii_digit())
         .filter(|s| !s.is_empty())

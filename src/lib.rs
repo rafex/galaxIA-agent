@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod authorization;
 pub mod config;
 pub mod ipfs;
 pub mod llm;

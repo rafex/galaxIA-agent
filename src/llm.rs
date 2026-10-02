@@ -42,7 +42,7 @@ pub struct StarModel {
 }
 
 impl StarModel {
-    pub fn new(
+    pub(crate) fn new(
         node: NodeHandle,
         model: impl Into<String>,
         preferred_provider: Option<String>,
@@ -63,7 +63,7 @@ impl StarModel {
     }
 
     /// Completa el request entregando cada fragmento de texto a `on_delta`.
-    pub async fn complete_streaming(
+    pub(crate) async fn complete_streaming(
         &self,
         request: CompletionRequest,
         on_delta: impl FnMut(&str),
@@ -76,6 +76,8 @@ impl StarModel {
                 tools,
                 model: request.model.clone().unwrap_or_else(|| self.model.clone()),
                 preferred_provider: self.preferred_provider.clone(),
+                // El Star fijado es el único que puede recibir el contenido.
+                allowed_provider_dids: self.preferred_provider.clone().map(|did| vec![did]),
                 timeout: self.timeout,
             },
             on_delta,

@@ -92,6 +92,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+    // Autorización por uso (SPEC-AUTH-0001): lista de nodos verificados por el
+    // operador y bitácora de auditoría (sin contenido).
+    let trusted_nodes: std::collections::HashSet<String> = std::env::var("FHS_TRUSTED_NODES")
+        .unwrap_or_default()
+        .split(',')
+        .map(|d| d.trim().split('#').next().unwrap_or_default().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
+    let audit_path = std::env::var("AUTH_AUDIT_PATH")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            config
+                .admin_token_path
+                .parent()
+                .map(|dir| dir.join("authorization-audit.log"))
+        });
+    let authorizer = galaxia_agent::authorization::Authorizer::new(
+        Arc::new(trusted_nodes),
+        audit_path.as_deref(),
+        None,
+    );
     let admin_token = galaxia_agent::admin::load_or_create_token(&config.admin_token_path)?;
     tokio::spawn(galaxia_agent::admin::serve(
         config.admin_addr,
@@ -108,6 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             ipfs: ipfs.clone(),
             attachment_max_bytes: config.attachment_max_bytes,
+            authorizer,
         },
     ));
 
@@ -217,11 +240,22 @@ async fn shutdown_signal() {
     tracing::info!("apagando galaxia-agent");
 }
 
-/// `galaxia-agent probe chat "<texto>"` · `probe tool <capability> <tool> '<json>'`:
-/// ejecuta una misión real contra la red y termina (diagnóstico).
+/// `galaxia-agent probe chat "<texto>"` · `probe tool <capability> <tool> '<json>'` ·
+/// `probe portal <multiaddr> "<pregunta>"`: ejecuta una misión real contra la
+/// red y termina (diagnóstico). Todo sale por el `Dispatcher`, con la misma
+/// puerta de autorización: sin interfaz, la política es `FHS_AUTH_POLICY`
+/// (por defecto **deniega**; `allow-synthetic` solo con datos sintéticos).
 async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    use galaxia_agent::p2p::{client, dynamic};
-    use galaxia_agent::protocol::fhs::Message;
+    use galaxia_agent::authorization::dispatcher::{
+        Dispatcher, LlmRequest, Outbound, ToolCallSpec,
+    };
+    use galaxia_agent::authorization::{Authorizer, Ctx, HeadlessPolicy, ItemSpec, DEFAULT_TTL};
+    use galaxia_agent::p2p::dynamic;
+    use galaxia_agent::protocol::fhs::{
+        AuthorizationDataClass as DataClass, AuthorizationDestination as Destination,
+    };
+    use galaxia_agent::runtime::events::Collected;
+    use galaxia_agent::runtime::providers::{self, Scope};
     use std::io::Write;
 
     // Un ciclo completo de anuncios (cada provider se anuncia cada 30 s).
@@ -232,44 +266,57 @@ async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::er
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     println!("providers conocidos: {}", node.peers.all().len());
+    let policy = HeadlessPolicy::from_env();
+    let authorizer = Authorizer::new(Arc::default(), None, Some(policy));
+    let dispatcher = Dispatcher::new(node.clone());
     match args.first().map(String::as_str) {
         Some("chat") => {
             let text = args
                 .get(1)
                 .cloned()
                 .unwrap_or_else(|| "Hola, ¿quién eres?".into());
+            let star = node
+                .peers
+                .stars()
+                .into_iter()
+                .next()
+                .ok_or("no hay Stars conocidos")?;
+            // El mensaje literal al Star elegido es el consentimiento implícito.
+            let grant = authorizer.implicit_user_message(
+                &star,
+                Some(Scope::Community),
+                &std::collections::HashSet::new(),
+                &text,
+            )?;
             let t0 = std::time::Instant::now();
             let mut first: Option<Duration> = None;
-            let outcome = client::chat(
-                node,
-                client::ChatRequest {
-                    messages: vec![
-                        Message {
-                            role: "system".into(),
-                            content: "Responde en español, breve.".into(),
-                            ..Default::default()
-                        },
-                        Message {
-                            role: "user".into(),
-                            content: text,
-                            ..Default::default()
-                        },
-                    ],
-                    tools: vec![],
-                    model: String::new(),
-                    preferred_provider: None,
-                    timeout: Duration::from_secs(300),
-                },
-                |delta| {
-                    first.get_or_insert(t0.elapsed());
-                    print!("{delta}");
-                    let _ = std::io::stdout().flush();
-                },
-            )
-            .await?;
+            let outcome = dispatcher
+                .llm(
+                    LlmRequest {
+                        star_did: &star.did,
+                        model: "",
+                        timeout: Duration::from_secs(300),
+                        temperature: 0.7,
+                        system: "Responde en español, breve.",
+                        user_text: &text,
+                        user_grant: &grant,
+                        notes: &[],
+                        blocks: vec![],
+                        history: vec![],
+                        tool_outputs: vec![],
+                        tool_notes: vec![],
+                        tools: &[],
+                    },
+                    |delta| {
+                        first.get_or_insert(t0.elapsed());
+                        print!("{delta}");
+                        let _ = std::io::stdout().flush();
+                    },
+                )
+                .await?;
             println!(
-                "\n— Star {} · primer delta {:?} · total {:?}",
-                outcome.provider,
+                "\n— Star {:?} · primer delta {:?} · total {:?}",
+                outcome.executed_by,
                 first,
                 t0.elapsed()
             );
@@ -277,7 +324,8 @@ async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::er
         Some("portal") => {
             use galaxia_agent::p2p::{framing, wire};
             use galaxia_agent::protocol::fhs::{
-                envelope::Payload, AgentStartMessage, ChatRequestMessage, KbDecisionMessage,
+                envelope::Payload, AgentStartMessage, AuthorizationDecisionMessage,
+                AuthorizationItemDecision, ChatRequestMessage, Message,
             };
             let addr: libp2p::Multiaddr = args
                 .get(1)
@@ -287,6 +335,7 @@ async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::er
                 .get(2)
                 .cloned()
                 .unwrap_or_else(|| "¿Qué dice el artículo 3 sobre la educación?".into());
+            let allow = policy == HeadlessPolicy::AllowSynthetic;
             let peer = node.dial(addr).await?;
             let mut stream = node
                 .stream_control()
@@ -329,19 +378,30 @@ async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::er
                         print!("{}", d.delta);
                         let _ = std::io::stdout().flush();
                     }
-                    Some(Payload::KbRecommended(kb)) => {
+                    Some(Payload::AuthorizationRequested(request)) => {
                         println!(
-                            "  · kbRecommended {:?} → acepto",
-                            kb.candidates
+                            "  · autorización {}: {:?} → {}",
+                            request.authorization_id,
+                            request
+                                .items
                                 .iter()
-                                .map(|c| &c.provider_name)
-                                .collect::<Vec<_>>()
+                                .map(|i| format!("{} → {}", i.capability_id, i.provider_name))
+                                .collect::<Vec<_>>(),
+                            if allow { "permito (política sintética)" } else { "deniego" }
                         );
                         framing::write_envelope(
                             &mut stream,
-                            &send(Payload::KbDecision(KbDecisionMessage {
-                                mission_id: kb.mission_id,
-                                r#use: true,
+                            &send(Payload::AuthorizationDecision(AuthorizationDecisionMessage {
+                                authorization_id: request.authorization_id,
+                                batch_digest: request.batch_digest,
+                                decisions: request
+                                    .items
+                                    .iter()
+                                    .map(|i| AuthorizationItemDecision {
+                                        item_id: i.item_id.clone(),
+                                        allow,
+                                    })
+                                    .collect(),
                             })),
                         )
                         .await?;
@@ -365,107 +425,57 @@ async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::er
                 }
             }
         }
-        Some("turn") => {
-            use galaxia_agent::runtime::{
-                agent::{AgentRuntime, Preferences, Turn},
-                events::{AgentEvent, EventSink},
-            };
-            struct Printer;
-            impl EventSink for Printer {
-                fn emit(&self, event: AgentEvent) {
-                    match event {
-                        AgentEvent::AssistantDelta { text } => {
-                            print!("{text}");
-                            let _ = std::io::stdout().flush();
-                        }
-                        other => println!("  · {other:?}"),
-                    }
-                }
-            }
-            let question = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "¿Qué dice el artículo 3 sobre la educación?".into());
-            let printer = Printer;
-            let preferences = Preferences::default();
-            let mut runtime = AgentRuntime::new(node.clone(), &printer, "probe-conv");
-            let (candidates, by_llm) = runtime.resolve_kb_candidates(&question, &preferences).await;
-            println!(
-                "KB recomendadas (por LLM: {by_llm}): {:?}",
-                candidates
-                    .iter()
-                    .map(|c| &c.provider_name)
-                    .collect::<Vec<_>>()
-            );
-            let t0 = std::time::Instant::now();
-            let answer = runtime
-                .run(
-                    Turn {
-                        message: question,
-                        kb_provider_ids: candidates.iter().map(|c| c.provider_id.clone()).collect(),
-                        ..Default::default()
-                    },
-                    &preferences,
-                )
-                .await?;
-            println!("\n— {} caracteres · {:?}", answer.len(), t0.elapsed());
-        }
-        Some("rig") => {
-            use galaxia_agent::llm;
-            let text = args.get(1).cloned().unwrap_or_else(|| "Hola".into());
-            let model = llm::StarModel::new(node.clone(), "", None, llm::DEFAULT_LLM_TIMEOUT);
-            let request = llm::request(
-                &[
-                    Message {
-                        role: "system".into(),
-                        content: "Responde en español, breve.".into(),
-                        ..Default::default()
-                    },
-                    Message {
-                        role: "user".into(),
-                        content: text,
-                        ..Default::default()
-                    },
-                ],
-                &[],
-                0.7,
-            );
-            let t0 = std::time::Instant::now();
-            let response = model
-                .complete_streaming(request, |delta| {
-                    print!("{delta}");
-                    let _ = std::io::stdout().flush();
-                })
-                .await?;
-            println!(
-                "\n— vía Rig · Star {:?} · {} caracteres · {:?}",
-                model.executed_by(),
-                llm::text_of(&response).len(),
-                t0.elapsed()
-            );
-        }
         Some("tool") => {
             let capability = args
                 .get(1)
                 .cloned()
                 .unwrap_or_else(|| "knowledge.query".into());
-            let tool = args.get(2).cloned().unwrap_or_else(|| "kb_query".into());
+            let tool_name = args.get(2).cloned().unwrap_or_else(|| "kb_query".into());
             let json: serde_json::Value =
                 serde_json::from_str(args.get(3).map(String::as_str).unwrap_or("{}"))?;
-            let outcome = client::call_tool(
-                node,
-                client::ToolRequest {
-                    capability,
-                    extra_capabilities: vec![],
-                    tool_name: tool,
-                    arguments: dynamic::from_json(&json)?,
-                    preferred_provider: None,
-                    timeout: Duration::from_secs(120),
-                    mission_id: None,
-                    allowed_provider_dids: None,
-                },
-            )
-            .await?;
+            let arguments = dynamic::from_json(&json)?;
+            let tool = providers::tools_for(&node.peers, &[capability.as_str()], None)
+                .into_iter()
+                .find(|t| t.name == tool_name)
+                .ok_or("ningún nodo ofrece esa herramienta")?;
+            let digest = galaxia_agent::authorization::tool_args_digest(&arguments)?;
+            let mut item = ItemSpec::new(
+                "probe-0",
+                capability.clone(),
+                tool.provider_id.clone(),
+                tool.provider_name.clone(),
+                DataClass::ToolArgs,
+                "argumentos de la sonda (datos sintéticos)",
+                digest,
+            );
+            item.destination = Destination::Network;
+            let sink = Collected::default();
+            let ctx = Ctx {
+                session: "probe",
+                conversation: "probe",
+                turn: "probe",
+                sink: &sink,
+            };
+            let resolution = authorizer.request(&ctx, vec![item], DEFAULT_TTL).await?;
+            let Some(grant) = resolution.grant("probe-0") else {
+                return Err("denegado: la sonda no tiene interfaz; define FHS_AUTH_POLICY=allow-synthetic solo si los datos son sintéticos".into());
+            };
+            let outcome = dispatcher
+                .tool_call(
+                    grant,
+                    ToolCallSpec {
+                        capability: &capability,
+                        extra_capabilities: &[],
+                        tool_name: &tool.name,
+                        provider_did: &tool.provider_id,
+                        timeout: Duration::from_secs(120),
+                        outbound: Outbound::Args {
+                            domain: galaxia_agent::authorization::DOMAIN_TOOL_ARGS,
+                            value: &arguments,
+                        },
+                    },
+                )
+                .await?;
             let result = outcome
                 .result
                 .as_ref()
@@ -478,7 +488,7 @@ async fn probe(node: &NodeHandle, args: &[String]) -> Result<(), Box<dyn std::er
             );
         }
         _ => println!(
-            "uso: galaxia-agent probe chat \"texto\" | probe tool <capability> <tool> '<json>'"
+            "uso: galaxia-agent probe chat \"texto\" | probe tool <capability> <tool> '<json>' | probe portal <multiaddr> \"pregunta\""
         ),
     }
     Ok(())
