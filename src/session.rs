@@ -7,7 +7,7 @@
 //! decidir una autorización) mientras el LLM responde. A diferencia del TS,
 //! `chatCancel` aborta de verdad el turno en curso.
 //!
-//! Autorización por uso (SPEC-AUTH-0001): el runtime pide la autorización y
+//! Autorización por uso (SPEC-AUTHZ-0001): el runtime pide la autorización y
 //! la espera; esta sesión solo transporta `authorization.requested` hacia el
 //! Portal y entrega la decisión al [`Authorizer`], que la consume una vez y
 //! solo para esta sesión.

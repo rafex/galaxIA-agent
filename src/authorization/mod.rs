@@ -1,4 +1,4 @@
-//! Autorización explícita por uso (SPEC-AUTH-0001, DEC-0099).
+//! Autorización explícita por uso (SPEC-AUTHZ-0001, DEC-0099).
 //!
 //! Todo contenido del usuario que salga del Navigator hacia otro nodo lleva un
 //! [`Grant`]: un permiso de un solo uso ligado a los bytes exactos (digest), al

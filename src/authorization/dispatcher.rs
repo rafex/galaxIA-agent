@@ -4,7 +4,7 @@
 //! **solo** con un [`Grant`] vigente cuyo digest coincide con los bytes que
 //! realmente van a salir y cuyo DID es el único que puede recibirlos. El
 //! permiso se consume de forma atómica antes de escribir en el transporte;
-//! un fallo posterior nunca lo devuelve (SPEC-AUTH-0001).
+//! un fallo posterior nunca lo devuelve (SPEC-AUTHZ-0001).
 //!
 //! `tests/outbound_boundary.rs` verifica que ningún otro archivo llame a las
 //! funciones crudas del SDK.

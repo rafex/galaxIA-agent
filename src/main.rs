@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
-    // Autorización por uso (SPEC-AUTH-0001): lista de nodos verificados por el
+    // Autorización por uso (SPEC-AUTHZ-0001): lista de nodos verificados por el
     // operador y bitácora de auditoría (sin contenido).
     let trusted_nodes: std::collections::HashSet<String> = std::env::var("FHS_TRUSTED_NODES")
         .unwrap_or_default()

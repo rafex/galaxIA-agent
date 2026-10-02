@@ -71,7 +71,7 @@ pub enum AgentEvent {
         filename: String,
         text: String,
     },
-    /// `authorization.requested` hacia el cliente (SPEC-AUTH-0001).
+    /// `authorization.requested` hacia el cliente (SPEC-AUTHZ-0001).
     AuthorizationRequested {
         authorization_id: String,
         conversation_id: String,

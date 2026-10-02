@@ -1,4 +1,4 @@
-//! Conformidad en el límite de salida (SPEC-AUTH-0001): el contenido del
+//! Conformidad en el límite de salida (SPEC-AUTHZ-0001): el contenido del
 //! usuario solo sale del Navigator por el `Dispatcher`, que exige un `Grant`.
 //! Este archivo vigila que ningún otro código llame a las funciones crudas del
 //! SDK (ofertas, streams con providers, el Star, IPFS) ni consuma permisos.

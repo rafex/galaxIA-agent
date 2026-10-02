@@ -5,7 +5,7 @@
 //! se usa a través de Rig (`llm::StarModel`), con streaming cuando la llamada
 //! no ofrece tools.
 //!
-//! **Autorización por uso (SPEC-AUTH-0001, DEC-0099):** este runtime no envía
+//! **Autorización por uso (SPEC-AUTHZ-0001, DEC-0099):** este runtime no envía
 //! nada por su cuenta. Cada salida de contenido del usuario hacia otro nodo
 //! pide un permiso (`Authorizer`) y se despacha solo por el `Dispatcher`, que
 //! comprueba el digest de lo que sale y fija el nodo. Lo que una operación
@@ -60,7 +60,7 @@ Sé conciso: responde en un máximo de 5 oraciones salvo que el usuario pida má
 const TEMPERATURE: f64 = 0.7;
 
 /// Registro de herramientas que el LLM puede pedir por su cuenta. Una que no
-/// esté aquí se deniega; las de efectos externos no están (SPEC-AUTH-0001).
+/// esté aquí se deniega; las de efectos externos no están (SPEC-AUTHZ-0001).
 /// Los comandos de chat (`/nombre`) no pasan por el LLM: los atiende la tabla
 /// de comandos autodescubiertos (SPEC-CMD-0001).
 const LLM_TOOL_CAPABILITIES: [&str; 2] = ["knowledge.query", "document.query"];
